@@ -136,4 +136,23 @@ pub enum ContractError {
     InvalidDecayRate = 66,
     /// `high_rep_threshold` outside its governance bound.
     InvalidRepThreshold = 67,
+    // ── Issues #1070–#1073: token configuration and SAC safety ─────
+    /// Issue #1070: the token does not answer `decimals()`, so its
+    /// precision cannot be verified and it cannot be allowlisted.
+    TokenDecimalsUnavailable = 68,
+    /// Issue #1070: declared decimals exceed `MAX_TOKEN_DECIMALS` or differ
+    /// from the token's own `decimals()`.
+    InvalidTokenDecimals = 69,
+    /// Issue #1070: the token is allowlisted but has no registered decimals
+    /// (legacy state); re-register it or run `migrate`.
+    TokenDecimalsNotConfigured = 70,
+    /// Issue #1072: the account's trustline / balance for this token is
+    /// deauthorized (frozen) or missing.
+    AccountFrozen = 71,
+    /// Issue #1073: the token does not expose the SAC `authorized()`
+    /// interface, so issuer freezes cannot be detected.
+    TokenAuthorizationUnavailable = 72,
+    /// Issue #1071: the contract's unreserved balance cannot cover a payout
+    /// (e.g. after an issuer clawback).
+    InsufficientContractBalance = 73,
 }
