@@ -423,6 +423,64 @@ fn test_vote_receipt_available_within_ttl() {
     assert!(t.contract.has_voted(&t.voter_a, &id));
 }
 
+// ── Issue #1099: persistent vote/veto receipt mirror ─────────────────────────
+
+/// The durable receipt is written alongside the temporary one, with a TTL.
+#[test]
+fn test_vote_receipt_persistent_mirror_written_with_ttl() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let key = StorageKey::VoteReceipt(id, t.voter_a.clone());
+    let (has_mirror, weight) = t.env.as_contract(&t.contract.address, || {
+        (
+            t.env.storage().persistent().has(&key),
+            t.env
+                .storage()
+                .persistent()
+                .get::<StorageKey, i128>(&key),
+        )
+    });
+
+    assert!(has_mirror, "#1099: persistent receipt must be written");
+    assert_eq!(weight, Some(1_000));
+}
+
+/// Archiving (evicting) the temporary receipt must not resurrect the
+/// double-vote window or erase the applied weight.
+#[test]
+fn test_vote_receipt_survives_temporary_archival() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    // Simulate host archival of the temporary receipts.
+    let voted_key = StorageKey::HasVoted(id, t.voter_a.clone());
+    let weight_key = StorageKey::AppliedVoteWeight(id, t.voter_a.clone());
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().temporary().remove(&voted_key);
+        t.env.storage().temporary().remove(&weight_key);
+    });
+
+    // #1099: fail-closed reads fall back to the durable mirror.
+    assert!(
+        t.contract.has_voted(&t.voter_a, &id),
+        "#1099: has_voted must survive temporary archival"
+    );
+    assert_eq!(
+        t.contract.get_applied_vote_weight(&id, &t.voter_a),
+        Some(1_000),
+        "#1099: applied weight must survive temporary archival"
+    );
+
+    // And a second vote must still be rejected.
+    assert_eq!(
+        t.contract.try_cast_vote(&t.voter_a, &id, &false),
+        Err(Ok(GovernanceError::AlreadyVoted))
+    );
+}
+
 #[test]
 #[should_panic]
 fn test_double_vote_rejected_with_already_voted_error() {
@@ -768,17 +826,25 @@ fn test_max_delegation_depth_cap_enforced() {
         .collect();
     for a in &nodes {
         t.gov_token_admin.mint(a, &100);
+        // Issue #805/#1098: the remediated delegation path requires an aged
+        // balance checkpoint before any weight is contributed. The legacy
+        // (pre-remediation) test delegated straight from a funded-but-not-aged
+        // address; that path now fails closed with InsufficientHoldingPeriod.
+        checkpoint_and_age(&t, a);
     }
 
     t.contract.delegate_votes(&nodes[0], &nodes[1]);
     t.contract.delegate_votes(&nodes[1], &nodes[2]);
     t.contract.delegate_votes(&nodes[2], &nodes[3]);
 
-    // Adding one more should exceed the cap of 3
+    // Issue #1098: three edges == the cap, so the chain is accepted as-is.
+    assert_eq!(t.contract.get_delegate(&nodes[0]), Some(nodes[1].clone()));
+    assert_eq!(t.contract.get_delegate(&nodes[1]), Some(nodes[2].clone()));
+    assert_eq!(t.contract.get_delegate(&nodes[2]), Some(nodes[3].clone()));
+    assert_eq!(t.contract.get_delegate(&nodes[3]), None);
 }
 
 #[test]
-#[should_panic(expected = "MaxDelegationDepthExceeded")]
 fn test_max_delegation_depth_cap_exceeded_panics() {
     extern crate std;
     let t = setup();
@@ -788,10 +854,102 @@ fn test_max_delegation_depth_cap_exceeded_panics() {
     let nodes: std::vec::Vec<soroban_sdk::Address> = (0..5)
         .map(|_| soroban_sdk::Address::generate(&t.env))
         .collect();
+    // Issue #805/#1098: age each node's checkpoint so the remediated delegation
+    // guard lets the depth check (not the holding-period guard) be the failure
+    // under test.
+    for a in &nodes {
+        t.gov_token_admin.mint(a, &100);
+        checkpoint_and_age(&t, a);
+    }
+    // Chain 0 -> 1 -> 2 -> 3 is exactly `max_depth` (3) edges: allowed.
     t.contract.delegate_votes(&nodes[0], &nodes[1]);
     t.contract.delegate_votes(&nodes[1], &nodes[2]);
     t.contract.delegate_votes(&nodes[2], &nodes[3]);
-    t.contract.delegate_votes(&nodes[3], &nodes[4]); // should panic
+
+    // Issue #1098: appending 3 -> 4 would make node 0's chain 4 edges long.
+    // The remediated guard observes the delegator's inbound depth (not just the
+    // delegate's forward chain, which is empty here) and rejects with the
+    // typed error rather than the host's numeric panic.
+    let res = t.contract.try_delegate_votes(&nodes[3], &nodes[4]);
+    assert_eq!(
+        res,
+        Err(Ok(GovernanceError::MaxDelegationDepthExceeded))
+    );
+
+    // The rejected edge left no trace.
+    assert_eq!(t.contract.get_delegate(&nodes[3]), None);
+}
+
+#[test]
+fn test_delegation_depth_relaxes_after_undelegate() {
+    extern crate std;
+    let t = setup();
+    t.env.mock_all_auths();
+    t.contract.set_max_delegation_depth(&3);
+
+    let nodes: std::vec::Vec<soroban_sdk::Address> = (0..5)
+        .map(|_| soroban_sdk::Address::generate(&t.env))
+        .collect();
+    for a in &nodes {
+        t.gov_token_admin.mint(a, &100);
+        checkpoint_and_age(&t, a);
+    }
+
+    // 0 -> 1 -> 2 -> 3 is exactly the cap.
+    t.contract.delegate_votes(&nodes[0], &nodes[1]);
+    t.contract.delegate_votes(&nodes[1], &nodes[2]);
+    t.contract.delegate_votes(&nodes[2], &nodes[3]);
+
+    // Node 3 already sits 3 hops deep (0 -> 1 -> 2 -> 3), so extending it with
+    // 3 -> 4 would produce a 4-edge chain: rejected.
+    assert_eq!(
+        t.contract.try_delegate_votes(&nodes[3], &nodes[4]),
+        Err(Ok(GovernanceError::MaxDelegationDepthExceeded))
+    );
+
+    // Issue #1098: undelegating the head must drop the 0 -> 1 reverse edge, so
+    // node 3's inbound depth relaxes to 2 (1 -> 2 -> 3) and the same edge is
+    // now legal.
+    t.contract.undelegate_votes(&nodes[0]);
+    t.contract.delegate_votes(&nodes[3], &nodes[4]); // 1 -> 2 -> 3 -> 4 (depth 3)
+
+    assert_eq!(t.contract.get_delegate(&nodes[3]), Some(nodes[4].clone()));
+}
+
+#[test]
+fn test_delegation_depth_relaxes_after_redelegation() {
+    extern crate std;
+    let t = setup();
+    t.env.mock_all_auths();
+    t.contract.set_max_delegation_depth(&3);
+
+    let nodes: std::vec::Vec<soroban_sdk::Address> = (0..5)
+        .map(|_| soroban_sdk::Address::generate(&t.env))
+        .collect();
+    for a in &nodes {
+        t.gov_token_admin.mint(a, &100);
+        checkpoint_and_age(&t, a);
+    }
+
+    t.contract.delegate_votes(&nodes[0], &nodes[1]);
+    t.contract.delegate_votes(&nodes[1], &nodes[2]);
+    t.contract.delegate_votes(&nodes[2], &nodes[3]);
+
+    // Node 3 is 3 hops deep, so this extension is rejected.
+    assert_eq!(
+        t.contract.try_delegate_votes(&nodes[3], &nodes[4]),
+        Err(Ok(GovernanceError::MaxDelegationDepthExceeded))
+    );
+
+    // Re-delegate node 0 away from node 1. The 0 -> 1 reverse edge must be
+    // removed from node 1's predecessor set; node 3's inbound depth relaxes to
+    // 2 (via 1 -> 2 -> 3) and the extension becomes legal. Stale reverse
+    // adjacency would keep the inbound depth at 3 and wrongly reject it.
+    t.contract.delegate_votes(&nodes[0], &nodes[2]);
+    t.contract.delegate_votes(&nodes[3], &nodes[4]); // 1 -> 2 -> 3 -> 4 (depth 3)
+
+    assert_eq!(t.contract.get_delegate(&nodes[0]), Some(nodes[2].clone()));
+    assert_eq!(t.contract.get_delegate(&nodes[3]), Some(nodes[4].clone()));
 }
 
 #[test]
@@ -1138,6 +1296,66 @@ fn test_veto_after_disable_returns_error() {
         GovContract::veto_proposal(t.env.clone(), t.admin.clone(), id, reason_hash(&t.env))
     });
     assert_eq!(res, Err(GovernanceError::VetoPowerDisabled));
+}
+
+// ── Issue #1099: durable veto approval receipts ──────────────────────────────
+
+/// A collected veto approval must survive archival of the temporary approval
+/// list, and must not be re-countable by the same signer.
+#[test]
+fn test_veto_approval_receipt_survives_archival_and_dedups() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+
+    let signer_a = t.admin.clone();
+    let signer_b = Address::generate(&t.env);
+    let signers = soroban_sdk::vec![&t.env, signer_a.clone(), signer_b.clone()];
+    t.contract.configure_veto_multisig(&signers, &2);
+
+    // First approval: below threshold, proposal stays Active.
+    t.contract
+        .veto_proposal(&signer_a, &id, &reason_hash(&t.env));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+
+    let receipt = StorageKey::VetoApprovalReceipt(id, signer_a.clone());
+    let mirror_written = t.env.as_contract(&t.contract.address, || {
+        t.env.storage().persistent().has(&receipt)
+    });
+    assert!(mirror_written, "#1099: per-signer veto receipt must be durable");
+
+    // Simulate host archival of the temporary approval list.
+    let approvals_key = StorageKey::VetoApprovals(id);
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().temporary().remove(&approvals_key);
+    });
+
+    // The approval is still counted from the durable mirror.
+    let approvals = t.contract.get_veto_approvals(&id);
+    assert_eq!(approvals.len(), 1);
+    assert!(approvals.contains(&signer_a));
+
+    // Re-approving is rejected despite the archived temporary list.
+    let res = t.env.as_contract(&t.contract.address, || {
+        GovContract::veto_proposal(t.env.clone(), signer_a.clone(), id, reason_hash(&t.env))
+    });
+    assert_eq!(res, Err(GovernanceError::VetoAlreadyApproved));
+
+    // Second distinct signer reaches the threshold and executes the veto.
+    t.contract
+        .veto_proposal(&signer_b, &id, &reason_hash(&t.env));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Vetoed);
+
+    // Receipts are cleared once the veto settles.
+    assert!(t.contract.get_veto_approvals(&id).is_empty());
+    let cleared = t.env.as_contract(&t.contract.address, || {
+        !t.env.storage().persistent().has(&receipt)
+    });
+    assert!(cleared, "#1099: veto receipts cleared after execution");
+
+    let res = t.env.as_contract(&t.contract.address, || {
+        GovContract::veto_proposal(t.env.clone(), signer_b.clone(), id, reason_hash(&t.env))
+    });
+    assert_eq!(res, Err(GovernanceError::NotVetoable));
 }
 
 /// Veto of a non-existent proposal returns ProposalNotFound.
@@ -2748,4 +2966,152 @@ fn test_pre_init_calls_return_not_initialized() {
         contract.try_disable_veto_power(),
         Err(Ok(GovernanceError::NotInitialized))
     );
+}
+
+// ── Issue #1101: property-based counterexample hunt ──────────────────────────
+//
+// These randomized tests attempt to *falsify* the governance invariants by
+// exploring adversarial operation orders (double votes with interleaved receipt
+// archival; arbitrary delegation/undelegation sequences). A generated failure
+// is a counterexample, and `scripts/run-formal-verification.sh` (wired into the
+// `formal-verification` workflow) fails CI on any counterexample.
+mod counterexample_invariants {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Invariants V2 + V7 (`docs/formal-verification.md`): a voter can
+        /// never increment the tally twice, even when the temporary receipt is
+        /// archived between attempts. The test tracks its own model of the
+        /// expected tally and asserts the contract matches it after every op.
+        #[test]
+        fn prop_no_double_vote_even_after_temporary_archival(
+            ops in proptest::collection::vec(
+                (0usize..3, any::<bool>(), any::<bool>()),
+                1..25,
+            )
+        ) {
+            let t = setup();
+            let id = create_fee_proposal(&t);
+            let voters = [t.voter_a.clone(), t.voter_b.clone(), t.proposer.clone()];
+            let weights: [i128; 3] = [1_000, 2_000, 1_000];
+
+            let mut voted = [false; 3];
+            let mut for_sum: i128 = 0;
+            let mut against_sum: i128 = 0;
+
+            for (idx, support, archive) in ops {
+                let voter = voters[idx].clone();
+                let res = t.contract.try_cast_vote(&voter, &id, &support);
+                if res.is_ok() {
+                    prop_assert!(!voted[idx], "double vote succeeded for voter {}", idx);
+                    voted[idx] = true;
+                    if support {
+                        for_sum += weights[idx];
+                    } else {
+                        against_sum += weights[idx];
+                    }
+                } else {
+                    prop_assert!(
+                        voted[idx],
+                        "unexpected non-AlreadyVoted failure for voter {}",
+                        idx
+                    );
+                }
+
+                if archive && voted[idx] {
+                    // Simulate the host archiving the temporary receipt.
+                    let hk = StorageKey::HasVoted(id, voter.clone());
+                    let wk = StorageKey::AppliedVoteWeight(id, voter.clone());
+                    t.env.as_contract(&t.contract.address, || {
+                        t.env.storage().temporary().remove(&hk);
+                        t.env.storage().temporary().remove(&wk);
+                    });
+                    prop_assert!(t.contract.has_voted(&voter, &id));
+                    prop_assert!(
+                        t.contract.try_cast_vote(&voter, &id, &support).is_err(),
+                        "vote succeeded after temporary archival (voter {})",
+                        idx
+                    );
+                }
+
+                let p = t.contract.get_proposal(&id);
+                prop_assert_eq!(p.votes_for, for_sum);
+                prop_assert_eq!(p.votes_against, against_sum);
+            }
+        }
+    }
+
+    /// Follow the forward delegation chain from `start`, returning
+    /// `(depth, cyclic)`. The walk is bounded by `bound` so a cycle cannot
+    /// spin forever.
+    fn chain_depth(t: &GovTestEnv, start: &Address, bound: u32) -> (u32, bool) {
+        let mut cursor = Some(start.clone());
+        let mut steps = 0u32;
+        while let Some(addr) = cursor {
+            steps += 1;
+            if steps > bound + 1 {
+                return (steps, true);
+            }
+            cursor = t.contract.get_delegate(&addr);
+        }
+        (steps - 1, false)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// Invariant DEL2 (`docs/formal-verification.md`): however delegation
+        /// and undelegation operations are interleaved, the forward graph
+        /// never contains a cycle and no chain exceeds `MaxDelegationDepth`.
+        #[test]
+        fn prop_delegation_graph_never_cycles_or_exceeds_depth(
+            ops in proptest::collection::vec(
+                (0usize..13, 0usize..13, any::<bool>()),
+                0..24,
+            )
+        ) {
+            const M: usize = 13;
+            let t = setup();
+            let mut addrs = soroban_sdk::Vec::new(&t.env);
+            for _ in 0..M {
+                let a = Address::generate(&t.env);
+                t.gov_token_admin.mint(&a, &100);
+                t.contract.checkpoint_balance(&a);
+                addrs.push_back(a);
+            }
+            let mut ledger = t.env.ledger().get();
+            ledger.sequence_number += MIN_VOTE_HOLD_LEDGERS + 1;
+            t.env.ledger().set(ledger);
+
+            let cap = t.contract.get_max_delegation_depth();
+
+            for (from, to, undelegate) in ops {
+                let from_addr = addrs.get(from as u32).unwrap();
+                let to_addr = addrs.get(to as u32).unwrap();
+                if undelegate {
+                    let _ = t.contract.try_undelegate_votes(&from_addr);
+                } else {
+                    let _ = t.contract.try_delegate_votes(&from_addr, &to_addr);
+                }
+
+                let mut max_depth = 0u32;
+                for addr in addrs.iter() {
+                    let (depth, cyclic) = chain_depth(&t, &addr, M as u32);
+                    prop_assert!(!cyclic, "delegation cycle detected");
+                    if depth > max_depth {
+                        max_depth = depth;
+                    }
+                }
+                prop_assert!(
+                    max_depth <= cap,
+                    "delegation chain depth {} exceeds cap {}",
+                    max_depth,
+                    cap
+                );
+            }
+        }
+    }
 }

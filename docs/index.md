@@ -42,6 +42,7 @@ Start here when you are looking for ILN protocol, contract, service, or contribu
 | [Pre-Audit Checklist](pre-audit-checklist.md) | Audit preparation tasks. |
 | [Formal Verification (lifecycle)](formal-verification.md) | Invoice/governance invariants. |
 | [Formal Verification (cross-contract)](formal-verification-cross-contract.md) | ILN × distribution × insurance system invariants. |
+| [Cross-Contract Proof Obligations](proof-obligations.md) | Machine-checked registry mapping each cross-contract invariant to its code path and discharging test. |
 
 
 ## Protocol Economics & Risk
