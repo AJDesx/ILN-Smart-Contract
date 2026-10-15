@@ -98,4 +98,42 @@ pub enum ContractError {
     /// Issue #1093: fewer price sources responded (or survived outlier
     /// rejection) than the governance-configured minimum quorum.
     PriceQuorumNotMet = 49,
+    // ── Variants referenced by merged code but previously undefined ──
+    // (restored so the crate compiles; codes appended, existing codes unchanged)
+    /// Multisig admin has already been initialized.
+    MultisigAlreadyConfigured = 50,
+    /// Signer set / threshold combination is invalid.
+    InvalidMultisigConfig = 51,
+    /// A multisig operation was attempted before multisig was configured.
+    MultisigNotConfigured = 52,
+    /// Caller is not in the multisig signer set.
+    NotAuthorizedSigner = 53,
+    /// An identical pending proposal already exists.
+    DuplicateProposal = 54,
+    /// No proposal exists with the given id.
+    ProposalNotFound = 55,
+    /// Proposal has already been executed.
+    ProposalAlreadyExecuted = 56,
+    /// Proposal is past its expiry and can no longer be signed or executed.
+    ProposalExpired = 57,
+    /// Signer has already approved this proposal.
+    AlreadySigned = 58,
+    /// Proposal does not yet have enough approvals to execute.
+    ThresholdNotReached = 59,
+    /// A signer rotation is already scheduled (Issue #640).
+    RotationAlreadyPending = 60,
+    /// No signer rotation is scheduled (Issue #640).
+    RotationNotFound = 61,
+    /// Signer rotation timelock has not yet elapsed (Issue #640).
+    RotationTimelockNotExpired = 62,
+    /// TWAP read requested with fewer observations than required.
+    InsufficientTwapObservations = 63,
+    /// Fund-queue index invariant violated (unreachable under normal execution).
+    QueueIndexOutOfBounds = 64,
+    /// Funder-list index invariant violated (unreachable under normal execution).
+    FunderIndexOutOfBounds = 65,
+    /// `decay_rate_bps` outside its governance bound.
+    InvalidDecayRate = 66,
+    /// `high_rep_threshold` outside its governance bound.
+    InvalidRepThreshold = 67,
 }
