@@ -60,3 +60,5 @@ Rewards are funded directly from the ILN DAO Treasury multi-sig.
 
 ### Safe Harbor
 Good faith security research that follows this disclosure policy will be considered authorized. We will not pursue civil or criminal action against researchers who comply with these guidelines.
+
+----
