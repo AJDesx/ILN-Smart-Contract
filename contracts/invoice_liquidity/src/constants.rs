@@ -41,3 +41,23 @@ pub const MAX_REPUTATION_DECAY_PERIODS: u64 = 1000;
 /// joining the queue can no longer immediately resolve the queue in the same
 /// block to lock-out competing LPs (Issue #MEV-1).
 pub const QUEUE_DELAY_LEDGERS: u32 = 120;
+
+/// Issue #1091: maximum number of entries a single invoice's fund queue may
+/// hold. `join_fund_queue` is O(n) in the queue length (duplicate scan +
+/// sorted insert) and rewrites the whole vector, so an unbounded queue lets
+/// anyone grief the queue (and, since Issue #1090, funding of the invoice)
+/// by spamming joins from fresh addresses until the entry exceeds Soroban's
+/// per-transaction resource limits.
+///
+/// When the queue is full a new LP is admitted only if its score strictly
+/// exceeds the lowest queued score, displacing that lowest entry — an entry
+/// that can no longer win, so every *potential* winner is retained until
+/// resolution.
+pub const MAX_FUND_QUEUE_LEN: u32 = 50;
+
+/// Issue #1091: TTL policy for the fund-queue keys (`FundQueue`,
+/// `FundQueueOpenedAt`, `QueueResolution`). Matches the invoice's own
+/// `extend_ttl(1_000_000, 2_000_000)` in `storage::save_invoice` so the
+/// queue cannot be archived while the invoice it gates is still live.
+pub const FUND_QUEUE_TTL_THRESHOLD: u32 = 1_000_000;
+pub const FUND_QUEUE_TTL_EXTEND_TO: u32 = 2_000_000;
