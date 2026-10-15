@@ -70,6 +70,7 @@ parameterized by a unique id/address, no collisions occur.
 | `LpScore(Address)` | `u32` | LP reputation score |
 | `FundQueue(u64)` | `Vec<LpFundRequest>` | LPs waiting to fund an invoice |
 | `QueueResolution(u64)` | `Address` | Selected LP from a funding queue |
+| `FundQueueOpenedAt(u64)` | `u32` | Ledger sequence when the first LP joined the queue (MEV guard, Issue #MEV-1) |
 | `TotalInvoices` | `u64` | Global protocol stat |
 | `TotalFunded` | `u64` | Global protocol stat |
 | `TotalPaid` | `u64` | Global protocol stat |
@@ -88,6 +89,29 @@ parameterized by a unique id/address, no collisions occur.
 No two variants share the same name, and every parameterized variant
 (`Invoice(u64)`, `PayerScore(Address)`, etc.) is disambiguated by its type and
 value — a `u64` invoice id and an `Address` can never serialize identically.
+
+### TTL Management and Upgrade Guard (Issue #1082)
+
+Five persistent key categories carry **protocol-critical data** and have explicit
+TTL management. Losing any of these entries to expiry mid-flight would cause
+silent data loss without any on-chain indication:
+
+| Key | TTL managed by | Threshold / Extend-to |
+|-----|---------------|-----------------------|
+| `InvoiceCore(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
+| `InvoiceMetadata(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
+| `FundQueue(u64)` | `storage::save_fund_queue` | 1,000,000 / 2,000,000 ledgers |
+| `FundQueueOpenedAt(u64)` | `storage::try_set_fund_queue_opened_at` | 1,000,000 / 2,000,000 ledgers |
+| `QueueResolution(u64)` | `storage::save_queue_resolution` | 1,000,000 / 2,000,000 ledgers |
+
+**Pre-upgrade TTL guard:** `upgrade()` calls
+`storage::validate_ttl_fields_pre_upgrade()` before swapping the WASM binary.
+The guard samples the most-recent `TTL_UPGRADE_SAMPLE_SIZE` (50) invoices and
+checks each of the five categories above. If any existing entry has a remaining
+TTL below `TTL_MIN_LEDGERS_BEFORE_UPGRADE` (500,000 ledgers ≈ 29 days), the
+upgrade is **rejected fail-closed** with
+`ContractError::UpgradeRemovesTtlFields` (code 50). The admin must refresh the
+affected entries by re-invoking the relevant storage helper before retrying.
 
 ---
 

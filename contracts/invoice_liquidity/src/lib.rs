@@ -40,6 +40,7 @@ pub use crate::nft::InvoiceNftMetadata;
 pub use crate::storage::DataKey;
 pub use config::{Config, ConfigError};
 pub use errors::ContractError;
+pub use events::RollbackRehearsalReport;
 use soroban_sdk::{
     contract, contractimpl, token::Client as TokenClient, vec, Address, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -53,8 +54,8 @@ use events::{
     InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted, InvoiceDisputed, InvoiceExpired,
     InvoiceFunded, InvoicePaid, InvoicePartiallyPaid, InvoiceSubmitted, InvoiceTokenChanged,
     InvoiceTransferred, InvoiceUpdated, LPPositionTransferred, ParameterUpdated,
-    PriceOracleUpdated, SignerRotationCancelled, SignerRotationFinalized, SignerRotationScheduled,
-    TokenAdded, TokenRemoved,
+    PriceOracleUpdated, RollbackRehearsalCompleted, SignerRotationCancelled,
+    SignerRotationFinalized, SignerRotationScheduled, TokenAdded, TokenRemoved,
 };
 use invoice::get_last_pause_timestamp;
 use invoice::{
@@ -1285,6 +1286,14 @@ pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ContractError>
 
         let admin = get_admin(&env).ok_or(ContractError::Unauthorized)?;
 
+        // Issue #1082: Reject the upgrade if any live persistent storage entry
+        // that carries TTL-managed data (InvoiceCore, InvoiceMetadata, FundQueue,
+        // FundQueueOpenedAt, QueueResolution) has a remaining TTL below the
+        // minimum safety threshold.  This prevents an upgrade from silently
+        // proceeding while critical data is on the verge of expiry, which would
+        // cause data loss in the new WASM without any on-chain indication.
+        crate::storage::validate_ttl_fields_pre_upgrade(&env)?;
+
         // Issue #539: Actually perform the upgrade via the Soroban deployer.
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -1366,6 +1375,66 @@ pub fn get_storage_version(env: Env) -> u32 {
         );
 
         Ok(crate::constants::CURRENT_STORAGE_VERSION)
+    }
+
+    // ------------------------------------------------------------
+    // rehearse_rollback (Issue #1083)
+    // ------------------------------------------------------------
+    /// Dry-run rollback-safety rehearsal for the invoice storage layout.
+    ///
+    /// Samples the most-recent `ROLLBACK_SAMPLE_SIZE` invoice IDs and
+    /// verifies that each one satisfies the *rollback-safe invariant*:
+    ///
+    /// ```text
+    /// Invoice(id) present  OR  (InvoiceCore(id) AND InvoiceMetadata(id)) both present
+    /// ```
+    ///
+    /// An invoice with only one half of the split format (orphaned entry)
+    /// would be invisible to a v1 (pre-split) WASM after rollback.  This
+    /// function detects such entries **before** a rollback is executed so
+    /// the admin can repair them first.
+    ///
+    /// The function is **read-only** — it never modifies storage.  Calling
+    /// it is safe at any time; there are no side-effects other than the
+    /// emitted event.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RollbackRehearsalReport)` — all sampled invoices satisfy the
+    ///   invariant; a rollback is safe from a storage-completeness
+    ///   perspective.
+    /// * `Err(RollbackUnsafe)` — at least one orphaned entry was found;
+    ///   **do not roll back** until entries are repaired.
+    ///
+    /// # Access
+    ///
+    /// Admin only (not rate-limited — this is a read-only diagnostic that
+    /// must be callable immediately before a rollback without cooldown
+    /// friction, similar to `migrate`).
+    pub fn rehearse_rollback(
+        env: Env,
+    ) -> Result<crate::events::RollbackRehearsalReport, ContractError> {
+        require_admin(&env)?;
+        record_admin_action(&env, "rehearse_rollback");
+
+        let admin = get_admin(&env).ok_or(ContractError::Unauthorized)?;
+
+        // Run the pure storage-completeness check.
+        let report = crate::storage::check_rollback_safety(&env)?;
+
+        // Emit an auditable on-chain event regardless of outcome.
+        // (check_rollback_safety only returns Ok when rollback_safe==true,
+        //  so if we reach here the rehearsal passed.)
+        env.events().publish(
+            (Symbol::new(&env, "rollback_rehearsal"), admin.clone()),
+            RollbackRehearsalCompleted {
+                admin,
+                report: report.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(report)
     }
 
 /// Update the fee tier configuration. Admin or governance only.

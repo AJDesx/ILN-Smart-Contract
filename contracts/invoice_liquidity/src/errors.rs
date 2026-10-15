@@ -98,4 +98,19 @@ pub enum ContractError {
     /// Issue #1093: fewer price sources responded (or survived outlier
     /// rejection) than the governance-configured minimum quorum.
     PriceQuorumNotMet = 49,
+    /// Issue #1082: upgrade rejected because one or more required persistent
+    /// storage entries (InvoiceCore, InvoiceMetadata, FundQueue,
+    /// FundQueueOpenedAt, QueueResolution) have a remaining TTL below the
+    /// `TTL_MIN_LEDGERS_BEFORE_UPGRADE` safety threshold.  The admin must
+    /// first call `save_invoice` (or the relevant queue helper) to refresh
+    /// TTLs before retrying the upgrade.
+    UpgradeRemovesTtlFields = 50,
+    /// Issue #1083: rollback rehearsal found one or more invoices in the
+    /// split layout (InvoiceCore + InvoiceMetadata) whose storage is
+    /// incomplete — either the core half or the metadata half is missing
+    /// (orphaned entry). Rolling back the WASM to a version that only reads
+    /// the monolithic `Invoice` key would silently skip these invoices.
+    /// The admin must repair the orphaned entries (e.g. by re-saving them
+    /// via `save_invoice`) before a rollback is safe.
+    RollbackUnsafe = 51,
 }
