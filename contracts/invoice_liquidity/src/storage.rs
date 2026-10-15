@@ -152,6 +152,10 @@ pub enum DataKey {
     /// never cleared on `unpause()` so operators keep a "last halted at"
     /// reference.
     LastPauseTimestamp,
+    /// Issue #1093: governance-configurable minimum number of price
+    /// sources that must respond *and* survive outlier rejection before
+    /// `get_verified_price` returns a value. Absent = 1 (legacy behavior).
+    MinPriceQuorum,
 }
 
 // ----------------------------------------------------------------
@@ -420,9 +424,9 @@ pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequ
 }
 
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::FundQueue(invoice_id), queue);
+    let key = DataKey::FundQueue(invoice_id);
+    env.storage().persistent().set(&key, queue);
+    extend_queue_key_ttl(env, &key);
 }
 
 pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
@@ -432,9 +436,9 @@ pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
 }
 
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::QueueResolution(invoice_id), approved_lp);
+    let key = DataKey::QueueResolution(invoice_id);
+    env.storage().persistent().set(&key, approved_lp);
+    extend_queue_key_ttl(env, &key);
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
@@ -447,6 +451,7 @@ pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
             .persistent()
             .set(&key, &env.ledger().sequence());
     }
+    extend_queue_key_ttl(env, &key);
 }
 
 /// Return the ledger sequence when the fund queue for `invoice_id` was first
@@ -455,6 +460,18 @@ pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
     env.storage()
         .persistent()
         .get(&DataKey::FundQueueOpenedAt(invoice_id))
+}
+
+/// Issue #1091: keep a queue key alive at least as long as the invoice it
+/// gates (see `FUND_QUEUE_TTL_*`). Before this, queue keys were written with
+/// the default persistent TTL while the invoice was extended to 1M–2M
+/// ledgers, so a slow-to-resolve queue could be archived mid-flight.
+fn extend_queue_key_ttl(env: &Env, key: &DataKey) {
+    env.storage().persistent().extend_ttl(
+        key,
+        crate::constants::FUND_QUEUE_TTL_THRESHOLD,
+        crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
+    );
 }
 
 // ----------------------------------------------------------------
