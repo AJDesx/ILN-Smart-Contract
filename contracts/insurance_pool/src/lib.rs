@@ -126,6 +126,12 @@ pub enum DataKey {
     RiskMultiplierNumerator,
     /// Risk multiplier denominator for premium calculation (Issue #528).
     RiskMultiplierDenominator,
+    /// Pending (timelocked) risk multiplier numerator (Issue #542/#528).
+    PendingRiskMultiplierNumerator,
+    /// Pending (timelocked) risk multiplier denominator (Issue #542/#528).
+    PendingRiskMultiplierDenominator,
+    /// Ledger timestamp at which the pending risk multiplier becomes executable.
+    RiskMultiplierEta,
     /// LP's historical default count (Issue #528).
     DefaultCount(Address),
     /// LP's historical claim count (Issue #528).
