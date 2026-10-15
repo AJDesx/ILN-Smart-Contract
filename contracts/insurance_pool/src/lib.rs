@@ -126,6 +126,12 @@ pub enum DataKey {
     RiskMultiplierNumerator,
     /// Risk multiplier denominator for premium calculation (Issue #528).
     RiskMultiplierDenominator,
+    /// Pending (timelocked) risk multiplier numerator (Issue #542/#528).
+    PendingRiskMultiplierNumerator,
+    /// Pending (timelocked) risk multiplier denominator (Issue #542/#528).
+    PendingRiskMultiplierDenominator,
+    /// Ledger timestamp at which the pending risk multiplier becomes executable.
+    RiskMultiplierEta,
     /// LP's historical default count (Issue #528).
     DefaultCount(Address),
     /// LP's historical claim count (Issue #528).
@@ -662,12 +668,15 @@ pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
 
         // Cross-contract call: reputation_bonus.get_reputation(lp) → ReputationScore
         // We only need the `score` field (0–100).
-        let args = soroban_sdk::vec![env.clone(), lp.into_val(&env)];
-        let result: Result<soroban_sdk::Val, soroban_sdk::Error> =
-            env.try_invoke_contract(&rep_contract, &soroban_sdk::symbol_short!("get_reputation"), args);
+        let args = soroban_sdk::vec![&env, soroban_sdk::IntoVal::into_val(&lp, &env)];
+        let result = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+            &rep_contract,
+            &soroban_sdk::Symbol::new(&env, "get_reputation"),
+            args,
+        );
 
         match result {
-            Ok(val) => {
+            Ok(Ok(val)) => {
                 // The ReputationScore is a ContractType; extract the score field.
                 // try_invoke_contract returns a Val — we need to decode it.
                 // For safety, use try-from with a fallback.
@@ -679,7 +688,7 @@ pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
                     .and_then(|v| v.checked_div(100))
                     .unwrap_or(default_count)
             }
-            Err(_) => {
+            _ => {
                 // Cross-contract call failed — no discount
                 default_count
             }

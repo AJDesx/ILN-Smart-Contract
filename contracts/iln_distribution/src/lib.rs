@@ -109,7 +109,7 @@ impl IlnDistribution {
     ///   retryable.
     pub fn initialize(env: Env, iln_contract: Address, gov_token: Address) {
         if env.storage().instance().has(&StorageKey::Initialized) {
-            return Err(DistributionError::AlreadyInitialized);
+            soroban_sdk::panic_with_error!(&env, DistributionError::AlreadyInitialized);
         }
 
         Self::require_gov_token_mint_authority(&env, &gov_token);
@@ -141,8 +141,6 @@ impl IlnDistribution {
                 gov_token,
             },
         );
-
-        Ok(())
     }
 
     /// Re-check the governance-token mint authority invariant (Issue #861).
