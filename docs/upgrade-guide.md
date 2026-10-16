@@ -42,6 +42,59 @@ A Soroban contract upgrade replaces the executable code (WASM binary) while pres
 
 Before initiating an upgrade, the following checklist **must** be completed:
 
+#### 1.0 TTL Field Liveness Check (Issue #1082)
+
+Starting with this release `upgrade()` enforces a **fail-closed TTL guard**
+before swapping the WASM binary.  The guard samples the most-recent 50
+invoices (`TTL_UPGRADE_SAMPLE_SIZE`) and checks five categories of persistent
+storage entry:
+
+| Key category | TTL managed by |
+|---|---|
+| `InvoiceCore(id)` | `storage::save_invoice` |
+| `InvoiceMetadata(id)` | `storage::save_invoice` |
+| `FundQueue(id)` | `storage::save_fund_queue` |
+| `FundQueueOpenedAt(id)` | `storage::try_set_fund_queue_opened_at` |
+| `QueueResolution(id)` | `storage::save_queue_resolution` |
+
+If any of the above entries has a remaining TTL below
+`TTL_MIN_LEDGERS_BEFORE_UPGRADE` (500,000 ledgers ≈ 29 days) the call returns
+`Err(ContractError::UpgradeRemovesTtlFields)` and **the WASM is not swapped**.
+
+**Pre-upgrade TTL check command:**
+
+```bash
+# Query a sample of InvoiceCore TTLs.  All must show >= 500000 remaining.
+# (Substitute real contract and invoice IDs.)
+for id in $(seq $((NEXT_ID-50)) $NEXT_ID); do
+  soroban contract invoke \
+    --id $CONTRACT_ID \
+    --network mainnet \
+    -- get_invoice --invoice_id $id 2>/dev/null | jq '.id // empty' && echo "OK $id"
+done
+```
+
+**Remediation if the guard fires:**
+
+```bash
+# Re-save affected invoices to refresh their TTL.
+# save_invoice extends InvoiceCore and InvoiceMetadata to 2_000_000 ledgers.
+soroban contract invoke \
+  --id $CONTRACT_ID \
+  --network mainnet \
+  --source-account $ADMIN_KEY \
+  -- refresh_invoice_ttl \
+  --invoice_id $AFFECTED_ID
+
+# For queue entries, call the appropriate helper.
+soroban contract invoke \
+  --id $CONTRACT_ID \
+  --network mainnet \
+  --source-account $ADMIN_KEY \
+  -- refresh_queue_ttl \
+  --invoice_id $AFFECTED_ID
+```
+
 #### 1.1 Code Audit & Testing
 - [ ] New WASM binary has passed security audit
 - [ ] All test suites pass (unit, integration, property-based tests)
@@ -307,6 +360,58 @@ pub fn migrate_state(env: Env) -> Result<(), ContractError> {
 
 **Use Case:** If post-upgrade issues are discovered and a rollback is necessary.
 
+### Step 0: Rehearse the Rollback (Issue #1083)
+
+**Before initiating any rollback**, call `rehearse_rollback()` to verify that
+the current storage state is rollback-safe.  This is a **read-only** check
+that does not modify storage.
+
+```bash
+# Perform a rollback rehearsal — safe to call at any time.
+soroban contract invoke \
+  --id CONTRACT_ID \
+  --network mainnet \
+  --source-account ADMIN_KEY \
+  -- rehearse_rollback
+```
+
+**Interpreting the result:**
+
+```json
+{
+  "invoices_checked": 50,
+  "split_format_count": 50,
+  "legacy_format_count": 0,
+  "orphaned_count": 0,
+  "rollback_safe": true
+}
+```
+
+* `rollback_safe: true` — proceed with the rollback (Steps 1-3 below).
+* `rollback_safe: false` / `orphaned_count > 0` — **do NOT roll back.**  One
+  or more invoices have only one half of the split storage format.  Rolling
+  back to a v1 WASM would make those invoices silently inaccessible.
+
+**Remediation when rollback is unsafe:**
+
+```bash
+# Re-save each affected invoice to restore both split halves.
+# This is safe to call while the contract is live.
+soroban contract invoke \
+  --id CONTRACT_ID \
+  --network mainnet \
+  --source-account ADMIN_KEY \
+  -- save_invoice \
+  --invoice_id $AFFECTED_ID
+
+# Re-run the rehearsal; it must report rollback_safe: true before proceeding.
+soroban contract invoke \
+  --id CONTRACT_ID \
+  --network mainnet \
+  --source-account ADMIN_KEY \
+  -- rehearse_rollback
+```
+
 ### 3-Step Rollback Process
 
 #### Step 1: Assess the Issue
@@ -365,7 +470,8 @@ soroban contract invoke \
 | Data Element | Impact | Mitigation |
 |---|---|---|
 | **New Invoices** (created after failed upgrade) | Lost (no longer compatible) | Require users to re-submit |
-| **Existing Invoices** | Recovered (state intact) | No action needed |
+| **Existing Invoices — split format** | Silently inaccessible in v1 WASM if either half is orphaned | Run `rehearse_rollback()` first; repair orphans before rolling back |
+| **Existing Invoices — legacy format** | Recovered (v1 WASM reads `Invoice(id)` directly) | No action needed |
 | **Reputation Scores** | Recovered | No action needed |
 | **Fund Queues** | Recovered (may be stale) | May need to refresh |
 
@@ -655,6 +761,8 @@ For upgrade-related questions or issues:
 # ILN Contract Upgrade Checklist v1.0
 
 ## Pre-Upgrade (Mainnet)
+- [ ] **TTL liveness verified** — all InvoiceCore/InvoiceMetadata/FundQueue entries in the most-recent 50 invoices have ≥ 500,000 ledgers of remaining TTL (Issue #1082)
+- [ ] **Rollback rehearsal passed** — `rehearse_rollback()` returns `rollback_safe: true` with `orphaned_count: 0`; no split-format orphans detected in the most-recent 50 invoices (Issue #1083)
 - [ ] Security audit completed
 - [ ] All tests passing (unit, integration, fuzzing)
 - [ ] Testnet upgrade successful

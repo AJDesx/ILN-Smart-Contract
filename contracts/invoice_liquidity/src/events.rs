@@ -581,3 +581,47 @@ pub struct InvoiceNftBurned {
     pub owner: Address,
     pub timestamp: u64,
 }
+
+// ── Issue #1083: Rollback rehearsal events ────────────────────────────────────
+
+/// The outcome of a `rehearse_rollback()` call.
+///
+/// Returned by `rehearse_rollback()` and included in the
+/// `RollbackRehearsalCompleted` event so off-chain monitors can assess
+/// rollback readiness without replaying the full storage scan.
+///
+/// # Fields
+///
+/// * `invoices_checked`   — total number of invoice IDs sampled
+///   (capped at `ROLLBACK_SAMPLE_SIZE`).
+/// * `split_format_count` — invoices stored as `InvoiceCore` + `InvoiceMetadata`
+///   (new format, both halves present).
+/// * `legacy_format_count`— invoices stored as monolithic `Invoice` key
+///   (old format, fully rollback-safe by itself).
+/// * `orphaned_count`     — invoices with only one half of the split format
+///   (either `InvoiceCore` without `InvoiceMetadata`, or vice versa).
+///   **Any non-zero value means rollback is unsafe.**
+/// * `rollback_safe`      — `true` iff `orphaned_count == 0` AND every
+///   checked invoice satisfies at least one of the two safe invariants.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RollbackRehearsalReport {
+    pub invoices_checked: u32,
+    pub split_format_count: u32,
+    pub legacy_format_count: u32,
+    pub orphaned_count: u32,
+    pub rollback_safe: bool,
+}
+
+/// Emitted by `rehearse_rollback()` when the rollback safety scan completes.
+///
+/// The `rollback_safe` field mirrors `RollbackRehearsalReport::rollback_safe`
+/// and is surfaced as a top-level event field so indexers can filter on it
+/// without deserializing the full report body.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RollbackRehearsalCompleted {
+    pub admin: Address,
+    pub report: RollbackRehearsalReport,
+    pub timestamp: u64,
+}

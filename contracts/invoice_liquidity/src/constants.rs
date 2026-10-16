@@ -62,3 +62,29 @@ pub const MAX_FUND_QUEUE_LEN: u32 = 50;
 /// queue cannot be archived while the invoice it gates is still live.
 pub const FUND_QUEUE_TTL_THRESHOLD: u32 = 1_000_000;
 pub const FUND_QUEUE_TTL_EXTEND_TO: u32 = 2_000_000;
+
+/// Issue #1082: minimum remaining TTL (in ledgers) that every live persistent
+/// storage entry must have before an upgrade is permitted.  At ~5 s per
+/// ledger, 500_000 ledgers ≈ 29 days — long enough to safely complete a
+/// migration without any data expiring mid-flight.
+///
+/// The pre-upgrade guard samples `InvoiceCore` / `InvoiceMetadata` for the
+/// most-recent `TTL_UPGRADE_SAMPLE_SIZE` invoices plus every live
+/// `FundQueue` / `FundQueueOpenedAt` / `QueueResolution` entry it can find
+/// in that same range. If *any* sampled entry's remaining TTL falls below
+/// this threshold the upgrade is rejected fail-closed, forcing the admin to
+/// refresh TTLs before retrying.
+pub const TTL_MIN_LEDGERS_BEFORE_UPGRADE: u32 = 500_000;
+
+/// Issue #1082: number of the most-recent invoice IDs to sample during the
+/// pre-upgrade TTL check.  Bounded to cap the resource cost of the check;
+/// the most-recently-written invoices are the most likely to still be
+/// active.
+pub const TTL_UPGRADE_SAMPLE_SIZE: u64 = 50;
+
+/// Issue #1083: number of the most-recent invoice IDs sampled during a
+/// rollback rehearsal.  Mirrors `TTL_UPGRADE_SAMPLE_SIZE` — the same
+/// population that was TTL-checked before the upgrade is also checked for
+/// storage-completeness before a rollback.  Bounded to keep the check
+/// within per-transaction resource limits.
+pub const ROLLBACK_SAMPLE_SIZE: u64 = 50;
