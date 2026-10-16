@@ -45,3 +45,6 @@ path = "../tests/full_protocol_lifecycle_test.rs"
 name = "cross_contract_invariants_test"
 path = "../tests/cross_contract_invariants_test.rs"
 
+[[test]]
+name = "audit_regression_test"
+path = "../tests/audit_regression_test.rs"

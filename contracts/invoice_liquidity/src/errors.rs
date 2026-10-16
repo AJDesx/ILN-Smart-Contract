@@ -98,19 +98,61 @@ pub enum ContractError {
     /// Issue #1093: fewer price sources responded (or survived outlier
     /// rejection) than the governance-configured minimum quorum.
     PriceQuorumNotMet = 49,
-    /// Issue #1082: upgrade rejected because one or more required persistent
-    /// storage entries (InvoiceCore, InvoiceMetadata, FundQueue,
-    /// FundQueueOpenedAt, QueueResolution) have a remaining TTL below the
-    /// `TTL_MIN_LEDGERS_BEFORE_UPGRADE` safety threshold.  The admin must
-    /// first call `save_invoice` (or the relevant queue helper) to refresh
-    /// TTLs before retrying the upgrade.
-    UpgradeRemovesTtlFields = 50,
-    /// Issue #1083: rollback rehearsal found one or more invoices in the
-    /// split layout (InvoiceCore + InvoiceMetadata) whose storage is
-    /// incomplete — either the core half or the metadata half is missing
-    /// (orphaned entry). Rolling back the WASM to a version that only reads
-    /// the monolithic `Invoice` key would silently skip these invoices.
-    /// The admin must repair the orphaned entries (e.g. by re-saving them
-    /// via `save_invoice`) before a rollback is safe.
-    RollbackUnsafe = 51,
+    // ── Variants referenced by merged code but previously undefined ──
+    // (restored so the crate compiles; codes appended, existing codes unchanged)
+    /// Multisig admin has already been initialized.
+    MultisigAlreadyConfigured = 50,
+    /// Signer set / threshold combination is invalid.
+    InvalidMultisigConfig = 51,
+    /// A multisig operation was attempted before multisig was configured.
+    MultisigNotConfigured = 52,
+    /// Caller is not in the multisig signer set.
+    NotAuthorizedSigner = 53,
+    /// An identical pending proposal already exists.
+    DuplicateProposal = 54,
+    /// No proposal exists with the given id.
+    ProposalNotFound = 55,
+    /// Proposal has already been executed.
+    ProposalAlreadyExecuted = 56,
+    /// Proposal is past its expiry and can no longer be signed or executed.
+    ProposalExpired = 57,
+    /// Signer has already approved this proposal.
+    AlreadySigned = 58,
+    /// Proposal does not yet have enough approvals to execute.
+    ThresholdNotReached = 59,
+    /// A signer rotation is already scheduled (Issue #640).
+    RotationAlreadyPending = 60,
+    /// No signer rotation is scheduled (Issue #640).
+    RotationNotFound = 61,
+    /// Signer rotation timelock has not yet elapsed (Issue #640).
+    RotationTimelockNotExpired = 62,
+    /// TWAP read requested with fewer observations than required.
+    InsufficientTwapObservations = 63,
+    /// Fund-queue index invariant violated (unreachable under normal execution).
+    QueueIndexOutOfBounds = 64,
+    /// Funder-list index invariant violated (unreachable under normal execution).
+    FunderIndexOutOfBounds = 65,
+    /// `decay_rate_bps` outside its governance bound.
+    InvalidDecayRate = 66,
+    /// `high_rep_threshold` outside its governance bound.
+    InvalidRepThreshold = 67,
+    // ── Issues #1070–#1073: token configuration and SAC safety ─────
+    /// Issue #1070: the token does not answer `decimals()`, so its
+    /// precision cannot be verified and it cannot be allowlisted.
+    TokenDecimalsUnavailable = 68,
+    /// Issue #1070: declared decimals exceed `MAX_TOKEN_DECIMALS` or differ
+    /// from the token's own `decimals()`.
+    InvalidTokenDecimals = 69,
+    /// Issue #1070: the token is allowlisted but has no registered decimals
+    /// (legacy state); re-register it or run `migrate`.
+    TokenDecimalsNotConfigured = 70,
+    /// Issue #1072: the account's trustline / balance for this token is
+    /// deauthorized (frozen) or missing.
+    AccountFrozen = 71,
+    /// Issue #1073: the token does not expose the SAC `authorized()`
+    /// interface, so issuer freezes cannot be detected.
+    TokenAuthorizationUnavailable = 72,
+    /// Issue #1071: the contract's unreserved balance cannot cover a payout
+    /// (e.g. after an issuer clawback).
+    InsufficientContractBalance = 73,
 }

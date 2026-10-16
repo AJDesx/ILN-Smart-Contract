@@ -156,6 +156,13 @@ pub enum DataKey {
     /// sources that must respond *and* survive outlier rejection before
     /// `get_verified_price` returns a value. Absent = 1 (legacy behavior).
     MinPriceQuorum,
+    /// Issue #1072: payout owed to `(recipient, token)` that could not be
+    /// delivered because the recipient's trustline was frozen. Claimable via
+    /// `claim_pending_payout` once re-authorized.
+    PendingPayout(Address, Address),
+    /// Issue #1071/#1072: sum of all `PendingPayout` entries for a token —
+    /// reserved balance that new payouts may not spend.
+    PendingPayoutTotal(Address),
 }
 
 // ----------------------------------------------------------------

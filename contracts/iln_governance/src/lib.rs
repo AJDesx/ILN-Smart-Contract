@@ -14,7 +14,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
-    token::Client as TokenClient, vec, Address, BytesN, Env, IntoVal, Symbol, Vec,
+    token::Client as TokenClient, vec, Address, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 /// Vote receipts only need to outlive the active voting window.
@@ -460,6 +460,26 @@ pub enum StorageKey {
     /// `GovernanceProposal` XDR schema — and every persisted proposal —
     /// stays byte-compatible.
     ProposalCreatedLedger(u64),
+    /// Issue #1098: reverse delegation adjacency — the set of addresses whose
+    /// forward `Delegation` pointer currently targets this address. Required to
+    /// enforce invariant DEL2 (delegation chain depth ≤ `MaxDelegationDepth`)
+    /// for *every* insertion order, including chains grown by appending at the
+    /// leaf. A forward-only check cannot observe how deep a *delegator* already
+    /// sits inside an inbound chain, so this adjacency closes that gap.
+    Delegators(Address),
+    /// Issue #1099: fail-closed persistent mirror of the `HasVoted` +
+    /// `AppliedVoteWeight` temporary vote receipt. Temporary entries can be
+    /// archived by the host, which would resurrect the "already voted" guard
+    /// and allow a double vote. This persistent record stores the applied
+    /// weight (0 is never written, so presence means "voted") and is the
+    /// authoritative guard; the temporary entry is retained for fast reads and
+    /// backwards compatibility.
+    VoteReceipt(u64, Address),
+    /// Issue #1099: per-signer persistent mirror of `VetoApprovals`. Because a
+    /// single temporary `Vec` can be archived, the veto threshold tally is
+    /// derived from these durable per-signer flags so an archived approval list
+    /// cannot reset a partially-collected veto multisig.
+    VetoApprovalReceipt(u64, Address),
 }
 
 // ================================================================
@@ -1171,9 +1191,17 @@ pub fn set_quadratic_voting_enabled(env: Env, enabled: bool) -> Result<(), Gover
 ///
 /// Access: Anyone
 pub fn get_applied_vote_weight(env: Env, proposal_id: u64, voter: Address) -> Option<i128> {
+        // Issue #1099: prefer the fast temporary receipt, but fall back to the
+        // durable mirror so an archived temporary entry does not erase the
+        // applied weight.
         env.storage()
             .temporary()
-            .get(&StorageKey::AppliedVoteWeight(proposal_id, voter))
+            .get(&StorageKey::AppliedVoteWeight(proposal_id, voter.clone()))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&StorageKey::VoteReceipt(proposal_id, voter))
+            })
     }
 
     /// Integer square root (floor) via binary search. `n` is assumed `>= 0`
@@ -1278,20 +1306,38 @@ pub fn delegate_votes(
         let proven_balance = Self::proven_own_balance(&env, &delegator, live_balance, now_ledger)?;
 
         // ── Cycle detection ───────────────────────────────────────
-        // Walk the forward chain from `delegate`.
-        // If we reach `delegator` at any point, the new edge would close a cycle.
+        // Walk the forward chain from `delegate`. If we reach `delegator`,
+        // the new edge would close a cycle. Bounded by `max_depth` so a
+        // pre-existing over-deep/cyclic graph cannot spin forever.
         let max_depth = Self::get_max_delegation_depth(env.clone());
         let mut cursor: Option<Address> = Self::get_delegate_raw(&env, &delegate);
-        let mut depth = 0u32;
-        while let Some(ref next) = cursor.clone() {
-            if depth >= max_depth {
-                return Err(GovernanceError::MaxDelegationDepthExceeded);
-            }
-            if *next == delegator {
+        let mut hops = 0u32;
+        while let Some(next) = cursor.clone() {
+            if next == delegator {
                 return Err(GovernanceError::DelegationCyclePrevented);
             }
-            cursor = Self::get_delegate_raw(&env, next);
-            depth += 1;
+            hops += 1;
+            if hops > max_depth {
+                return Err(GovernanceError::MaxDelegationDepthExceeded);
+            }
+            cursor = Self::get_delegate_raw(&env, &next);
+        }
+
+        // ── Issue #1098: exact DEL2 depth check ───────────────────
+        // The resulting chain from `delegator` is `1 + forward_depth(delegate)`,
+        // and every predecessor of `delegator` inherits the same extension, so
+        // the longest chain that will exist after the write is
+        // `longest_inbound_depth(delegator) + 1 + forward_depth(delegate)`.
+        // Validation happens before any mutation so a rejected call leaves no
+        // partial state behind.
+        let downstream = Self::forward_delegation_depth(&env, &delegate);
+        let upstream = Self::longest_inbound_depth(&env, &delegator);
+        if upstream
+            .saturating_add(1)
+            .saturating_add(downstream)
+            > max_depth
+        {
+            return Err(GovernanceError::MaxDelegationDepthExceeded);
         }
 
         // ── Find the terminal node for `delegate` ─────────────────
@@ -1301,12 +1347,17 @@ pub fn delegate_votes(
         if let Some(old_delegate) = Self::get_delegate_raw(&env, &delegator) {
             let old_terminal = Self::resolve_terminal(&env, &old_delegate);
             Self::adjust_delegated_to_me(&env, &old_terminal, -proven_balance);
+            // Issue #1098: keep the reverse adjacency in sync.
+            Self::remove_delegator(&env, &old_delegate, &delegator);
         }
 
         // ── Store forward pointer ─────────────────────────────────
         env.storage()
             .persistent()
             .set(&StorageKey::Delegation(delegator.clone()), &delegate);
+        // Issue #1098: record the reverse edge so later depth checks can see
+        // how deep this delegator sits inside an inbound chain.
+        Self::add_delegator(&env, &delegate, &delegator);
 
         // ── Add weight to new terminal ────────────────────────────
         Self::adjust_delegated_to_me(&env, &terminal, proven_balance);
@@ -1348,6 +1399,9 @@ pub fn undelegate_votes(env: Env, delegator: Address) -> Result<(), GovernanceEr
             let old_terminal = Self::resolve_terminal(&env, &old_delegate);
             let delegator_balance = Self::get_own_balance_for_delegation(&env, &delegator)?;
             Self::adjust_delegated_to_me(&env, &old_terminal, -delegator_balance);
+
+            // Issue #1098: drop the reverse adjacency edge too.
+            Self::remove_delegator(&env, &old_delegate, &delegator);
 
             env.storage()
                 .persistent()
@@ -1411,7 +1465,15 @@ pub fn cast_vote(
         }
 
         let voted_key = StorageKey::HasVoted(proposal_id, voter.clone());
-        if env.storage().temporary().has(&voted_key) {
+        // Issue #1099: the temporary receipt may have been archived by the
+        // host; consult the durable mirror too so an archived receipt cannot
+        // be used to vote twice. Fail-closed: presence in either store blocks.
+        if env.storage().temporary().has(&voted_key)
+            || env
+                .storage()
+                .persistent()
+                .has(&StorageKey::VoteReceipt(proposal_id, voter.clone()))
+        {
             return Err(GovernanceError::AlreadyVoted);
         }
 
@@ -1491,6 +1553,18 @@ pub fn cast_vote(
             VOTE_RECEIPT_TTL_THRESHOLD_LEDGERS,
             VOTE_RECEIPT_TTL_LEDGERS,
         );
+
+        // Issue #1099: durable mirror of the receipt. Temporary storage can be
+        // archived, which would clear the "already voted" guard above; this
+        // persistent record is the fail-closed source of truth.
+        let receipt_key = StorageKey::VoteReceipt(proposal_id, voter.clone());
+        env.storage().persistent().set(&receipt_key, &weight);
+        env.storage().persistent().extend_ttl(
+            &receipt_key,
+            VOTE_RECEIPT_TTL_THRESHOLD_LEDGERS,
+            VOTE_RECEIPT_TTL_LEDGERS,
+        );
+
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
@@ -1918,10 +1992,33 @@ pub fn get_veto_threshold(env: Env) -> u32 {
 ///
 /// Access: Anyone
 pub fn get_veto_approvals(env: Env, proposal_id: u64) -> Vec<Address> {
-        env.storage()
-            .temporary()
-            .get(&StorageKey::VetoApprovals(proposal_id))
-            .unwrap_or(Vec::new(&env))
+        // Issue #1099: derive from the durable per-signer flags so an archived
+        // temporary approval list does not read as "no approvals".
+        Self::veto_approvals_from_persistent(&env, proposal_id)
+    }
+
+    /// Issue #1099: rebuild the veto approval list from the persistent
+    /// per-signer receipts (ordered by the configured signer set).
+    fn veto_approvals_from_persistent(env: &Env, proposal_id: u64) -> Vec<Address> {
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::VetoSigners)
+            .unwrap_or(Vec::new(env));
+        let mut approvals = Vec::new(env);
+        for signer in signers.iter() {
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::VetoApprovalReceipt(
+                    proposal_id,
+                    signer.clone(),
+                ))
+            {
+                approvals.push_back(signer);
+            }
+        }
+        approvals
     }
 
     // ── Issue #68 / #642: veto_proposal ───────────────────────────
@@ -1987,26 +2084,31 @@ pub fn veto_proposal(
             _ => return Err(GovernanceError::NotVetoable),
         }
 
-        // ── Record this signer's approval ─────────────────────────
-        let approvals_key = StorageKey::VetoApprovals(proposal_id);
-        let mut approvals: Vec<Address> = env
-            .storage()
-            .temporary()
-            .get(&approvals_key)
-            .unwrap_or(Vec::new(&env));
-        if approvals.contains(&signer) {
+        // ── Record this signer's approval (Issue #1099: durable) ──
+        let receipt_key = StorageKey::VetoApprovalReceipt(proposal_id, signer.clone());
+        if env.storage().persistent().has(&receipt_key) {
             return Err(GovernanceError::VetoAlreadyApproved);
         }
-        approvals.push_back(signer.clone());
+        env.storage().persistent().set(&receipt_key, &true);
+        env.storage().persistent().extend_ttl(
+            &receipt_key,
+            VOTE_RECEIPT_TTL_THRESHOLD_LEDGERS,
+            VOTE_RECEIPT_TTL_LEDGERS,
+        );
+
+        // Durable per-signer flags are authoritative, so rebuild the list from
+        // them (an archived temporary list can no longer reset the tally). The
+        // temporary copy is kept only as a fast-read mirror.
+        let approvals_key = StorageKey::VetoApprovals(proposal_id);
+        let approvals: Vec<Address> = Self::veto_approvals_from_persistent(&env, proposal_id);
+        env.storage().temporary().set(&approvals_key, &approvals);
+        env.storage().temporary().extend_ttl(
+            &approvals_key,
+            VOTE_RECEIPT_TTL_THRESHOLD_LEDGERS,
+            VOTE_RECEIPT_TTL_LEDGERS,
+        );
 
         if approvals.len() < threshold {
-            env.storage().temporary().set(&approvals_key, &approvals);
-            env.storage().temporary().extend_ttl(
-                &approvals_key,
-                VOTE_RECEIPT_TTL_THRESHOLD_LEDGERS,
-                VOTE_RECEIPT_TTL_LEDGERS,
-            );
-
             env.events().publish(
                 (
                     Symbol::new(&env, "veto_approved"),
@@ -2025,6 +2127,11 @@ pub fn veto_proposal(
 
         // ── Threshold reached: execute the veto ───────────────────
         env.storage().temporary().remove(&approvals_key);
+        for approved in approvals.iter() {
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::VetoApprovalReceipt(proposal_id, approved));
+        }
 
         proposal.status = ProposalStatus::Vetoed;
         env.storage()
@@ -2163,9 +2270,11 @@ pub fn get_proposal(env: Env, proposal_id: u64) -> Result<GovernanceProposal, Go
 ///
 /// Access: Anyone
 pub fn has_voted(env: Env, voter: Address, proposal_id: u64) -> bool {
-        env.storage()
-            .temporary()
-            .has(&StorageKey::HasVoted(proposal_id, voter))
+        env.storage().temporary().has(&StorageKey::HasVoted(proposal_id, voter.clone()))
+            || env
+                .storage()
+                .persistent()
+                .has(&StorageKey::VoteReceipt(proposal_id, voter))
     }
 
     // ── Private helpers ──────────────────────────────────────────
@@ -2193,6 +2302,97 @@ pub fn has_voted(env: Env, voter: Address, proposal_id: u64) -> bool {
         env.storage()
             .persistent()
             .get(&StorageKey::Delegation(addr.clone()))
+    }
+
+    /// Issue #1098: direct predecessors of `addr` in the delegation graph.
+    fn get_delegators(env: &Env, addr: &Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Delegators(addr.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Issue #1098: record that `delegator` now points at `delegate`.
+    fn add_delegator(env: &Env, delegate: &Address, delegator: &Address) {
+        let key = StorageKey::Delegators(delegate.clone());
+        let mut list = Self::get_delegators(env, delegate);
+        if !list.contains(delegator.clone()) {
+            list.push_back(delegator.clone());
+            env.storage().persistent().set(&key, &list);
+        }
+    }
+
+    /// Issue #1098: drop the `delegator -> delegate` reverse edge.
+    fn remove_delegator(env: &Env, delegate: &Address, delegator: &Address) {
+        let key = StorageKey::Delegators(delegate.clone());
+        let list = Self::get_delegators(env, delegate);
+        let mut filtered = Vec::new(env);
+        for item in list.iter() {
+            if item != delegator.clone() {
+                filtered.push_back(item);
+            }
+        }
+        if filtered.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &filtered);
+        }
+    }
+
+    /// Issue #1098: number of edges on the forward delegation chain starting at
+    /// `start` (0 for a terminal). The DEL2 invariant guarantees this never
+    /// exceeds `MaxDelegationDepth`, so the walk is bounded.
+    fn forward_delegation_depth(env: &Env, start: &Address) -> u32 {
+        let max_depth = Self::get_max_delegation_depth(env.clone());
+        let mut current = start.clone();
+        let mut depth = 0u32;
+        while depth < max_depth {
+            match Self::get_delegate_raw(env, &current) {
+                Some(next) => {
+                    current = next;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+        depth
+    }
+
+    /// Issue #1098: length (in edges) of the longest delegation path that
+    /// terminates at `start`, computed over the reverse adjacency. Used to
+    /// compute the resulting chain length for every predecessor of a delegator
+    /// when a new edge is added, so DEL2 is enforced regardless of insertion
+    /// order. Iterative (explicit stack) to keep host stack depth bounded;
+    /// memoized so shared sub-paths are visited once.
+    fn longest_inbound_depth(env: &Env, start: &Address) -> u32 {
+        let mut best: Map<Address, u32> = Map::new(env);
+        let mut stack: Vec<(Address, bool)> = Vec::new(env);
+        stack.push_back((start.clone(), false));
+        while let Some((node, processed)) = stack.pop_back() {
+            if processed {
+                let preds = Self::get_delegators(env, &node);
+                let mut node_best = 0u32;
+                for p in preds.iter() {
+                    let candidate = best.get(p.clone()).unwrap_or(0).saturating_add(1);
+                    if candidate > node_best {
+                        node_best = candidate;
+                    }
+                }
+                best.set(node.clone(), node_best);
+            } else {
+                if best.contains_key(node.clone()) {
+                    continue;
+                }
+                stack.push_back((node.clone(), true));
+                let preds = Self::get_delegators(env, &node);
+                for p in preds.iter() {
+                    if !best.contains_key(p.clone()) {
+                        stack.push_back((p, false));
+                    }
+                }
+            }
+        }
+        best.get(start.clone()).unwrap_or(0)
     }
 
     /// Walk forward pointers to find the terminal node (one with no further delegate).
@@ -2272,3 +2472,7 @@ pub fn has_voted(env: Env, voter: Address, proposal_id: u64) -> bool {
 mod test;
 #[cfg(test)]
 mod tests_benchmarks;
+#[cfg(test)]
+mod tests_differential;
+#[cfg(test)]
+mod tests_proof_obligations;

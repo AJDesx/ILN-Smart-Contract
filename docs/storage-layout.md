@@ -177,8 +177,12 @@ variant names (`Config`/`Admin` vs. `Reputation(Address)` vs.
 | `Proposal(u64)` | `GovernanceProposal` | Proposal record |
 | `ProposalCount` | `u64` | Proposal id counter |
 | `VoteWeightSnapshot(u64, Address)` | `i128` | Snapshotted vote weight per proposal/voter |
-| `HasVoted(u64, Address)` | `bool` | Whether an address has voted on a proposal |
+| `HasVoted(u64, Address)` | `bool` | Whether an address has voted on a proposal (temporary) |
+| `VoteReceipt(u64, Address)` | `i128` | Durable mirror of the applied vote weight — fail-closed double-vote guard if the temporary receipt is archived (Issue #1099, persistent) |
+| `VetoApprovals(u64)` | `Vec<Address>` | Per-proposal veto approvals (temporary mirror) |
+| `VetoApprovalReceipt(u64, Address)` | `bool` | Durable per-signer veto approval flag; the veto tally is derived from these so an archived approval list cannot reset a partially-collected veto (Issue #1099, persistent) |
 | `Delegation(Address)` | `Address` | Forward delegation pointer (Issue #64) |
+| `Delegators(Address)` | `Vec<Address>` | Reverse delegation adjacency — direct predecessors of `Address`; required to enforce the DEL2 depth bound for every insertion order (Issue #1098) |
 | `DelegatedToMe(Address)` | `i128` | Running tally of weight delegated to an address (Issue #64) |
 | `ExecutionDelay` | `u32` | Timelock delay (in ledgers) applied between a proposal passing and executing (Issue #62) |
 | `Admin` | `Address` | Admin address (veto power) |
@@ -221,6 +225,21 @@ collisions regardless of how similarly the two contracts name their keys.
 which were merged into the single `DataKey` enum. Variant names were
 preserved during the merge, so existing serialized data remains
 byte-compatible.
+
+### 9.1 Purely additive governance keys (Issues #1098, #1099)
+`iln_governance::StorageKey` gained two new variants, both **appended at the end
+of the enum** so no existing variant's ordinal changes:
+
+- `Delegators(Address)` (#1098) — reverse delegation adjacency.
+- `VoteReceipt(u64, Address)` and `VetoApprovalReceipt(u64, Address)` (#1099) —
+  durable mirrors of the temporary vote/veto receipts.
+
+Because these are additive and read with fail-safe defaults (`unwrap_or(0)`,
+`unwrap_or(false)`, or an empty `Vec`), a contract upgrade requires **no data
+migration**: pre-existing proposals, votes, delegations, and veto state remain
+valid, and the new keys are simply absent until the first write on the new code.
+This follows the additive-change pattern accepted by the storage freeze in §10.1.
+
 
 ## 10. Storage Layout Freeze — Sign-off Gate (Issue #651)
 

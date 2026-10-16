@@ -10,6 +10,15 @@ To regenerate: `make changelog`
 
 ---
 
+## Unreleased
+
+- test(contract): regression guards for fail-closed token decimals (decimals logic itself landed in #1070) (#1094)
+- fix(contract): enforce `MAX_FUND_QUEUE_LEN` in `join_fund_queue` with strict-score displacement (#1095)
+- test: audit-path regression suite `audit_regression_test` (#1096)
+- docs: evidence → remediation control map (#1097)
+
+---
+
 ## Mainnet Launch
 
 This release marks the initial mainnet launch of the Invoice Liquidity Network (ILN) protocol on Stellar. It consolidates deliverables across all three development and audit-hardening batches into a production-grade decentralized invoice factoring protocol.
@@ -610,3 +619,4 @@ For operational and risk guidance, consult the [Mainnet Launch Notes & Known Lim
 
 [Unreleased]: https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/compare/HEAD...HEAD
 
+---

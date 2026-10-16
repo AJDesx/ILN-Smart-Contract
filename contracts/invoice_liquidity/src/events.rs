@@ -172,6 +172,28 @@ pub struct TokenAdded {
     pub decimals: u32,
 }
 
+/// Issue #1072: a payout to a frozen recipient was escrowed instead of
+/// transferred.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayoutEscrowed {
+    pub invoice_id: u64,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// Recipient's total pending balance for this token after the credit.
+    pub total_pending: i128,
+}
+
+/// Issue #1072: an escrowed payout was released to its recipient.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPayoutClaimed {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 /// Emitted when governance removes a token from the funding allowlist (Issue #19).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]

@@ -27,6 +27,7 @@ use constants::{
 };
 pub mod oracle_interface;
 pub mod oracle_registry;
+pub mod token_safety;
 pub mod twap;
 use insurance_pool::InsurancePoolInterfaceClient;
 use oracle_registry::OracleFeedType;
@@ -182,6 +183,14 @@ impl InvoiceLiquidityContract {
         );
         env.storage().persistent().set(
             &crate::storage::DataKey::TokenDecimals(usdc_token.clone()),
+            &6_u32,
+        );
+        // Issue #1070: every approved token must have registered decimals.
+        // EURC was previously approved without an entry and silently fell
+        // back to 6 at validation time; 6 is persisted here so behavior is
+        // unchanged but explicit.
+        env.storage().persistent().set(
+            &crate::storage::DataKey::TokenDecimals(eurc_token.clone()),
             &6_u32,
         );
 
@@ -816,14 +825,22 @@ pub fn add_token(env: Env, token: Address, decimals: u32) -> Result<(), Contract
         check_rate_limit(&env, "add_token", DEFAULT_RATE_LIMIT_LEDGERS)?;
         record_admin_action(&env, "add_token");
 
-        let token_client = token_client(&env, &token);
-        let contract_address = env.current_contract_address();
-        let test_amount: i128 = 1_000_000;
         let admin_address: Address = env
             .storage()
             .instance()
             .get(&crate::storage::DataKey::Admin)
             .unwrap();
+
+        // Issue #1070: the declared precision must match the token's own
+        // `decimals()`; tokens that cannot report decimals are rejected.
+        token_safety::validate_token_decimals(&env, &token, decimals)?;
+        // Issue #1073: the token must expose SAC authorization flags, and
+        // this contract and the admin must be authorized holders.
+        token_safety::validate_sac_authorization(&env, &token, &admin_address)?;
+
+        let token_client = token_client(&env, &token);
+        let contract_address = env.current_contract_address();
+        let test_amount: i128 = 1_000_000;
         let before_balance = token_client.balance(&contract_address);
 
         token_client.transfer(&admin_address, &contract_address, &test_amount);
@@ -919,15 +936,60 @@ pub fn remove_token(env: Env, token: Address) -> Result<(), ContractError> {
     /// Return the registered decimal precision for a token.
     ///
     /// Returns `None` when the token has never been registered via
-    /// `add_token` or `initialize`. For the two bootstrap tokens (USDC at 6
-    /// decimals and XLM at 7 decimals) these are set automatically during
-    /// `initialize`.
+    /// `add_token` or `initialize`. The bootstrap tokens (USDC and EURC at
+    /// 6 decimals, XLM at 7) are set automatically during `initialize`;
+    /// legacy deployments are backfilled by `migrate` (Issue #1070).
     ///
     /// Access: Anyone
     pub fn get_token_decimals(env: Env, token: Address) -> Option<u32> {
         env.storage()
             .persistent()
             .get(&crate::storage::DataKey::TokenDecimals(token))
+    }
+
+    /// Issue #1072: amount of `token` escrowed for `recipient` because their
+    /// trustline was frozen when a payout or refund was due.
+    ///
+    /// Access: Anyone
+    pub fn get_pending_payout(env: Env, recipient: Address, token: Address) -> i128 {
+        token_safety::pending_payout(&env, &recipient, &token)
+    }
+
+    /// Issue #1072: withdraw an escrowed payout once `recipient`'s trustline
+    /// is authorized again.
+    ///
+    /// # Arguments
+    /// * `env` — host environment
+    /// * `recipient` — address the payout was escrowed for
+    /// * `token` — token the payout is denominated in
+    ///
+    /// # Returns
+    /// * `Ok(amount)` — the amount transferred to `recipient`
+    ///
+    /// # Errors
+    /// * `NothingToClaim` if nothing is escrowed for `(recipient, token)`
+    /// * `AccountFrozen` while `recipient` is still deauthorized
+    /// * `InsufficientContractBalance` if an issuer clawback left the
+    ///   contract unable to cover it
+    /// * `ContractPaused` / `Reentrancy`
+    ///
+    /// The escrow entry is left intact on every error path.
+    ///
+    /// Access: `recipient` (require_auth)
+    pub fn claim_pending_payout(
+        env: Env,
+        recipient: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        lock_reentrancy(&env)?;
+        if is_paused(&env) {
+            unlock_reentrancy(&env);
+            return Err(ContractError::ContractPaused);
+        }
+        recipient.require_auth();
+        let amount = token_safety::claim_pending(&env, &recipient, &token)?;
+        unlock_reentrancy(&env);
+        Ok(amount)
     }
 
     // ------------------------------------------------------------
@@ -1359,6 +1421,25 @@ pub fn get_storage_version(env: Env) -> u32 {
         // if current < 2 {
         //     // migrate from v1 to v2
         // }
+
+        // v3 (Issue #1070): submit/batch/convert no longer fall back to 6
+        // decimals. Backfill the bootstrap tokens with the precision they
+        // were effectively using so legacy deployments keep working. Only
+        // missing entries are written; existing values are never changed.
+        if current < 3 {
+            if let Some(config) = crate::storage::get_config(&env) {
+                for (token, decimals) in [
+                    (config.usdc_sac_address, 6_u32),
+                    (config.eurc_sac_address, 6_u32),
+                    (config.xlm_sac_address, 7_u32),
+                ] {
+                    let key = crate::storage::DataKey::TokenDecimals(token);
+                    if !env.storage().persistent().has(&key) {
+                        env.storage().persistent().set(&key, &decimals);
+                    }
+                }
+            }
+        }
 
         env.storage().instance().set(
             &crate::storage::DataKey::StorageVersion,
@@ -1861,6 +1942,8 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         if !is_approved_token(&env, &new_token) {
             return Err(ContractError::Unauthorized);
         }
+        // Issue #1070: and must have registered decimals.
+        token_safety::registered_token_decimals(&env, &new_token)?;
 
         let old_token = invoice.token.clone();
         invoice.token = new_token.clone();
@@ -2060,6 +2143,27 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                 insert_pos = i;
                 break;
             }
+        }
+
+        // Issue #1095: the queue is bounded. When full, a joiner must strictly
+        // outscore the lowest-scored entry (the tail, since the queue is sorted
+        // descending) and displaces it; otherwise the join is rejected.
+        if queue.len() >= crate::constants::MAX_FUND_QUEUE_LEN {
+            let tail = queue.last().ok_or(ContractError::QueueFull)?;
+            if score <= tail.score {
+                return Err(ContractError::QueueFull);
+            }
+            queue.pop_back();
+            env.events().publish(
+                (Symbol::new(&env, "fund_queue_displaced"), invoice_id),
+                crate::events::FundQueueEntryDisplaced {
+                    invoice_id,
+                    displaced_lp: tail.lp,
+                    displaced_score: tail.score,
+                    new_lp: lp.clone(),
+                    new_score: score,
+                },
+            );
         }
 
         queue.insert(insert_pos, new_request);
@@ -2378,6 +2482,15 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             / 10_000;
         let cost = normalized_fund_amount.saturating_sub(fund_discount);
 
+        // Issue #1072: a frozen funder gets a typed error rather than an
+        // opaque transfer trap. If this funding completes the invoice, the
+        // freelancer must also be able to receive, so the LP never pays into
+        // an invoice whose payout cannot be delivered.
+        token_safety::require_authorized(&env, &invoice.token, &funder)?;
+        if prospective_funded == invoice.amount {
+            token_safety::require_authorized(&env, &invoice.token, &invoice.freelancer)?;
+        }
+
         token.transfer(&funder, &contract_address, &cost);
 
         // --- Update contributor list ---
@@ -2410,7 +2523,12 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                 / 10_000;
             let freelancer_payout = invoice.amount.saturating_sub(discount_amount);
 
-            token.transfer(&contract_address, &invoice.freelancer, &freelancer_payout);
+            token_safety::transfer_out_strict(
+                &env,
+                &invoice.token,
+                &invoice.freelancer,
+                freelancer_payout,
+            )?;
 
             invoice.status = InvoiceStatus::Funded;
             invoice.funded_at = Some(env.ledger().timestamp().try_into().unwrap());
@@ -2641,8 +2759,6 @@ pub fn transfer_lp_position(
                 // CEI: update state before external token transfers
                 invoice.status = InvoiceStatus::Cancelled;
                 save_invoice(&env, &invoice);
-                let token = token_client(&env, &invoice.token);
-                let contract_address = env.current_contract_address();
                 for i in 0..funders.len() {
                     let (funder_addr, fund_amt) = funders.get(i).unwrap();
                     let fund_discount = fund_amt
@@ -2650,7 +2766,13 @@ pub fn transfer_lp_position(
                         .unwrap_or(0)
                         / 10_000;
                     let refund = fund_amt.saturating_sub(fund_discount);
-                    token.transfer(&contract_address, &funder_addr, &refund);
+                    token_safety::pay_or_escrow(
+                        &env,
+                        &invoice.token,
+                        &funder_addr,
+                        refund,
+                        invoice_id,
+                    )?;
                 }
             }
             InvoiceStatus::Funded => return Err(ContractError::AlreadyFunded),
@@ -2796,6 +2918,9 @@ pub fn transfer_lp_position(
             .checked_add(amount)
             .ok_or(ContractError::ArithmeticOverflow)?;
 
+        // Issue #1072: typed error for a frozen payer.
+        token_safety::require_authorized(&env, &invoice.token, &invoice.payer)?;
+
         // Payer sends partial/full amount to the contract
         token.transfer(&invoice.payer, &contract_address, &normalized_amount);
 
@@ -2832,7 +2957,8 @@ pub fn transfer_lp_position(
                 .instance()
                 .get(&crate::storage::DataKey::Admin)
                 .unwrap();
-            token.transfer(&contract_address, &admin, &protocol_fee);
+            // Issue #1072: a frozen fee recipient must not block settlement.
+            token_safety::pay_or_escrow(&env, &invoice.token, &admin, protocol_fee, invoice_id)?;
         }
 
         let distribute_amount = invoice.amount.saturating_sub(protocol_fee);
@@ -2879,9 +3005,15 @@ pub fn transfer_lp_position(
                 .ok_or(ContractError::FunderIndexOutOfBounds)?;
             let funder_share =
                 distribute_amount.checked_mul(fund_amt).unwrap_or(0) / invoice.amount;
-            if funder_share > 0 {
-                token.transfer(&contract_address, &funder_addr, &funder_share);
-            }
+            // Issue #1072: one frozen funder must not block the payer or the
+            // other funders; their share is escrowed instead.
+            token_safety::pay_or_escrow(
+                &env,
+                &invoice.token,
+                &funder_addr,
+                funder_share,
+                invoice_id,
+            )?;
         }
 
         // Increment total paid counter
@@ -3013,8 +3145,6 @@ pub fn transfer_lp_position(
             InvoiceStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
         }
 
-        let token = token_client(&env, &invoice.token);
-        let contract_address = env.current_contract_address();
 
         // CEI: update state before external token transfers
         invoice.status = InvoiceStatus::Defaulted;
@@ -3030,7 +3160,7 @@ pub fn transfer_lp_position(
                 .unwrap_or(0)
                 / 10_000;
             let refund = fund_amt.saturating_sub(fund_discount);
-            token.transfer(&contract_address, &funder_addr, &refund);
+            token_safety::pay_or_escrow(&env, &invoice.token, &funder_addr, refund, invoice_id)?;
             total_refunded = total_refunded.saturating_add(refund);
         }
 
@@ -3382,8 +3512,6 @@ pub fn resolve_dispute(
                 invoice.status = InvoiceStatus::Cancelled;
                 save_invoice(&env, &invoice);
 
-                let token = token_client(&env, &invoice.token);
-                let contract_address = env.current_contract_address();
 
                 // Refund LPs if it was funded. Loop bound is 0..funders.len()
                 // so the .ok_or branch is unreachable under normal execution;
@@ -3401,14 +3529,26 @@ pub fn resolve_dispute(
                             .unwrap_or(0)
                             / 10_000;
                         let refund = fund_amt.saturating_sub(fund_discount);
-                        token.transfer(&contract_address, &funder_addr, &refund);
+                        token_safety::pay_or_escrow(
+                            &env,
+                            &invoice.token,
+                            &funder_addr,
+                            refund,
+                            invoice_id,
+                        )?;
                     }
                 }
 
                 // Refund payer if a partial payment was made.
                 if invoice.amount_paid > 0 {
                     let refund_amount = invoice.amount_paid;
-                    token.transfer(&contract_address, &invoice.payer, &refund_amount);
+                    token_safety::pay_or_escrow(
+                        &env,
+                        &invoice.token,
+                        &invoice.payer,
+                        refund_amount,
+                        invoice_id,
+                    )?;
 
                     env.events().publish(
                         (
@@ -3898,8 +4038,8 @@ fn validate_invoice_terms(
 /// - 6-decimal token (USDC): minimum = 1_000_000  (= 1 USDC)
 /// - 7-decimal token (XLM):  minimum = 10_000_000 (= 1 XLM)
 ///
-/// Falls back to the 6-decimal floor when no decimals are registered for the
-/// token (i.e. a token added via legacy code paths before Issue #23).
+/// Fails with `TokenDecimalsNotConfigured` when no decimals are registered
+/// for the token. This previously fell back silently to 6 (Issue #1070).
 fn validate_invoice_terms_with_token(
     env: &Env,
     amount: i128,
@@ -3907,11 +4047,7 @@ fn validate_invoice_terms_with_token(
     discount_rate: u32,
     token: &Address,
 ) -> Result<(), ContractError> {
-    let decimals: u32 = env
-        .storage()
-        .persistent()
-        .get(&crate::storage::DataKey::TokenDecimals(token.clone()))
-        .unwrap_or(6);
+    let decimals = token_safety::registered_token_decimals(env, token)?;
 
     let min_amount: i128 = ten_pow(decimals);
     validate_invoice_terms_for_min(env, amount, min_amount, due_date, discount_rate)
@@ -4070,3 +4206,5 @@ mod tests_nft_event_emission;
 mod tests_nft_transfer_consistency;
 // Issues #914, #915, #916, #918: Configuration parameter bounds validation
 mod tests_config_parameter_bounds;
+// Issues #1070–#1073: token decimals, SAC authorization, frozen accounts, clawback
+mod tests_token_safety;

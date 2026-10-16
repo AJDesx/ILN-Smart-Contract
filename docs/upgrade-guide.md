@@ -885,6 +885,23 @@ fails the build before any on-chain run.
 > The on-chain `migrate` entrypoint applies exactly the transform validated by
 > `--simulate`; keep the two in lockstep when the schema evolves further.
 
+## v2 → v3: Token Decimals Backfill (Issue #1070)
+
+Submit, batch submit and `convert_invoice_token` no longer fall back to 6
+decimals when a token has no registered precision. Deployments initialized
+before this change have no `TokenDecimals` entry for EURC.
+
+1. `upgrade(V3_WASM_HASH)`.
+2. Immediately call `migrate()`, which returns `3`. It writes only missing
+   decimals for the bootstrap tokens (USDC 6, EURC 6, XLM 7, matching the
+   previous effective behavior) and never overwrites an existing entry.
+3. Verify with `get_token_decimals` for USDC, EURC and XLM.
+
+Until step 2 runs, EURC invoices fail with `TokenDecimalsNotConfigured` (70).
+This is fail-closed and needs no funds recovery. See
+[token-safety.md](token-safety.md#upgrade-and-migration) for the pending-payout
+escrow introduced in the same release, and its rollback caveat.
+
 ---
 
 **Document Prepared By:** DevOps & Security Team  
