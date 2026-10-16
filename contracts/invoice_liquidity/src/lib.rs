@@ -2099,6 +2099,10 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     /// Queue is kept sorted by score (descending) for O(1) resolution.
     /// Access: LP only
     pub fn join_fund_queue(env: Env, lp: Address, invoice_id: u64) -> Result<(), ContractError> {
+        if is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
+
         require_lp(&env, &lp)?;
 
         if !invoice_exists(&env, invoice_id) {
@@ -2196,6 +2200,10 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     /// by `join_fund_queue`, so this operation is O(1) — just returning the first element.
     /// Access: Anyone
     pub fn resolve_fund_queue(env: Env, invoice_id: u64) -> Result<Address, ContractError> {
+        if is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
+
         if !invoice_exists(&env, invoice_id) {
             return Err(ContractError::InvoiceNotFound);
         }
@@ -4210,3 +4218,5 @@ mod tests_nft_transfer_consistency;
 mod tests_config_parameter_bounds;
 // Issues #1070–#1073: token decimals, SAC authorization, frozen accounts, clawback
 mod tests_token_safety;
+// Issue #1025: Benchmark extension cost at maximum depth and queue TTL / pause controls
+mod tests_max_depth_extension;

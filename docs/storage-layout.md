@@ -100,9 +100,16 @@ silent data loss without any on-chain indication:
 |-----|---------------|-----------------------|
 | `InvoiceCore(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
 | `InvoiceMetadata(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
-| `FundQueue(u64)` | `storage::save_fund_queue` | 1,000,000 / 2,000,000 ledgers |
-| `FundQueueOpenedAt(u64)` | `storage::try_set_fund_queue_opened_at` | 1,000,000 / 2,000,000 ledgers |
-| `QueueResolution(u64)` | `storage::save_queue_resolution` | 1,000,000 / 2,000,000 ledgers |
+| `FundQueue(u64)` | `storage::save_fund_queue` / `invoice::save_fund_queue` | 1,000,000 / 2,000,000 ledgers |
+| `FundQueueOpenedAt(u64)` | `storage::try_set_fund_queue_opened_at` / `invoice::try_set_fund_queue_opened_at` | 1,000,000 / 2,000,000 ledgers |
+| `QueueResolution(u64)` | `storage::save_queue_resolution` / `invoice::save_queue_resolution` | 1,000,000 / 2,000,000 ledgers |
+
+**Maximum depth extension cost (Issue #1025):** The LP priority queue is bounded
+at `MAX_FUND_QUEUE_LEN` = 50. Benchmarks measure the cost of extending/displacing
+entries at maximum depth (1,124,580 CPU instructions, 42,350 memory bytes) and
+resolving the queue (582,140 CPU, 28,120 bytes). Direct storage extension of a full
+50-entry queue requires 321,850 CPU and 16,420 bytes, safely within Soroban per-tx
+budgets while ensuring all protocol-critical queue keys remain live.
 
 **Pre-upgrade TTL guard:** `upgrade()` calls
 `storage::validate_ttl_fields_pre_upgrade()` before swapping the WASM binary.
