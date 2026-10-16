@@ -98,4 +98,9 @@ pub enum ContractError {
     /// Issue #1093: fewer price sources responded (or survived outlier
     /// rejection) than the governance-configured minimum quorum.
     PriceQuorumNotMet = 49,
+    /// Issue #1094: an allowlisted token has no registered decimal precision.
+    /// Invoice validation fails closed instead of assuming 6 decimals.
+    TokenDecimalsMissing = 60,
+    /// Issue #1094: `add_token` called with decimals above `MAX_TOKEN_DECIMALS`.
+    InvalidTokenDecimals = 61,
 }

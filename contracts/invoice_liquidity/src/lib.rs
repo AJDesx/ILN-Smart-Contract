@@ -183,6 +183,12 @@ impl InvoiceLiquidityContract {
             &crate::storage::DataKey::TokenDecimals(usdc_token.clone()),
             &6_u32,
         );
+        // Issue #1094: EURC is allowlisted above, so it must also carry
+        // decimals (6) — otherwise invoice validation would fail closed.
+        env.storage().persistent().set(
+            &crate::storage::DataKey::TokenDecimals(eurc_token.clone()),
+            &6_u32,
+        );
 
         // approve native XLM SAC (7 decimals)
         env.storage().persistent().set(
@@ -812,6 +818,9 @@ pub fn set_insurance_pool(env: Env, pool: Address) -> Result<(), ContractError> 
 /// Access: Admin only
 pub fn add_token(env: Env, token: Address, decimals: u32) -> Result<(), ContractError> {
         require_admin(&env)?;
+        if decimals > crate::constants::MAX_TOKEN_DECIMALS {
+            return Err(ContractError::InvalidTokenDecimals);
+        }
         check_rate_limit(&env, "add_token", DEFAULT_RATE_LIMIT_LEDGERS)?;
         record_admin_action(&env, "add_token");
 
@@ -1991,6 +2000,27 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                 insert_pos = i;
                 break;
             }
+        }
+
+        // Issue #1095: the queue is bounded. When full, a joiner must strictly
+        // outscore the lowest-scored entry (the tail, since the queue is sorted
+        // descending) and displaces it; otherwise the join is rejected.
+        if queue.len() >= crate::constants::MAX_FUND_QUEUE_LEN {
+            let tail = queue.last().ok_or(ContractError::QueueFull)?;
+            if score <= tail.score {
+                return Err(ContractError::QueueFull);
+            }
+            queue.pop_back();
+            env.events().publish(
+                (Symbol::new(&env, "fund_queue_displaced"), invoice_id),
+                crate::events::FundQueueEntryDisplaced {
+                    invoice_id,
+                    displaced_lp: tail.lp,
+                    displaced_score: tail.score,
+                    new_lp: lp.clone(),
+                    new_score: score,
+                },
+            );
         }
 
         queue.insert(insert_pos, new_request);
@@ -3829,8 +3859,9 @@ fn validate_invoice_terms(
 /// - 6-decimal token (USDC): minimum = 1_000_000  (= 1 USDC)
 /// - 7-decimal token (XLM):  minimum = 10_000_000 (= 1 XLM)
 ///
-/// Falls back to the 6-decimal floor when no decimals are registered for the
-/// token (i.e. a token added via legacy code paths before Issue #23).
+/// Issue #1094: fails closed with `TokenDecimalsMissing` when no decimals are
+/// registered for the token — there is no silent 6-decimal fallback. Tokens
+/// allowlisted before decimals were tracked must be backfilled via `add_token`.
 fn validate_invoice_terms_with_token(
     env: &Env,
     amount: i128,
@@ -3842,7 +3873,7 @@ fn validate_invoice_terms_with_token(
         .storage()
         .persistent()
         .get(&crate::storage::DataKey::TokenDecimals(token.clone()))
-        .unwrap_or(6);
+        .ok_or(ContractError::TokenDecimalsMissing)?;
 
     let min_amount: i128 = ten_pow(decimals);
     validate_invoice_terms_for_min(env, amount, min_amount, due_date, discount_rate)

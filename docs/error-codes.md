@@ -49,6 +49,10 @@ Source of truth: [`contracts/invoice_liquidity/src/errors.rs`](../contracts/invo
 | 36 | `InvoiceNftNotFound` | No NFT exists for the requested invoice. | Querying or transferring an NFT that was never minted (or was burned). | Verify the invoice was funded and the NFT was minted before querying. |
 | 37 | `InvoiceNftNotOwned` | The caller is not the current owner of this NFT. | A non-owner attempted to transfer or burn an NFT. | Verify ownership via `invoice_nft_owner` before attempting transfer or burn. |
 | 38 | `AmountTooSmall` | The invoice amount is below the configurable minimum threshold. | The submitted invoice amount is too low to be economically viable. | Increase the invoice amount to meet the minimum required by the contract configuration. |
+| 60 | `TokenDecimalsMissing` | An allowlisted token has no registered decimal precision (Issue #1094). | Legacy allowlisted token (e.g. EURC on a pre-#1094 deployment) never had `TokenDecimals` written. | Admin re-registers the token via `add_token(token, decimals)`; invoice validation no longer assumes 6 decimals. |
+| 61 | `InvalidTokenDecimals` | `add_token` was called with decimals above `MAX_TOKEN_DECIMALS` (18) (Issue #1094). | Wrong units passed (e.g. stroop count instead of decimal places). | Pass the token's real decimal places (0–18). |
+
+> **Note:** codes 47–49 (`QueueFull`, `QueueUnresolved`, `PriceQuorumNotMet`) are declared in `errors.rs` but collide with the multisig variants referenced by `multisig.rs`; the new codes above deliberately start at 60 to avoid worsening that collision. Reconciling 47–59 is tracked separately.
 
 ---
 

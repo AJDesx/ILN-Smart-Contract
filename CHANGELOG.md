@@ -10,6 +10,15 @@ To regenerate: `make changelog`
 
 ---
 
+## Unreleased
+
+- fix(contract): fail closed when a token has no registered decimals; register EURC decimals at `initialize`; bound `add_token` decimals (#1094)
+- fix(contract): enforce `MAX_FUND_QUEUE_LEN` in `join_fund_queue` with strict-score displacement (#1095)
+- test: audit-path regression suite `audit_regression_test` (#1096)
+- docs: evidence → remediation control map (#1097)
+
+---
+
 ## Mainnet Launch
 
 This release marks the initial mainnet launch of the Invoice Liquidity Network (ILN) protocol on Stellar. It consolidates deliverables across all three development and audit-hardening batches into a production-grade decentralized invoice factoring protocol.
