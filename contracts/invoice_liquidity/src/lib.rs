@@ -51,12 +51,13 @@ use crate::storage::get_admin;
 use events::{
     AdminChanged, AppealResolved, ContractInitialized, ContractPaused, ContractUnpaused,
     ContractUpgraded, DefaultAppealed, DisputeResolved, DisputeUpheldPayerRefund,
-    DistributionContractUpdated, FundQueueResolutionAttempted, FundQueueResolved, FundRequested,
-    InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted, InvoiceDisputed, InvoiceExpired,
-    InvoiceFunded, InvoicePaid, InvoicePartiallyPaid, InvoiceSubmitted, InvoiceTokenChanged,
-    InvoiceTransferred, InvoiceUpdated, LPPositionTransferred, ParameterUpdated,
-    PriceOracleUpdated, RollbackRehearsalCompleted, SignerRotationCancelled,
-    SignerRotationFinalized, SignerRotationScheduled, TokenAdded, TokenRemoved,
+    DistributionContractUpdated, EqualScoreManipulationSimulated, FundQueueResolutionAttempted,
+    FundQueueResolved, FundRequested, InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted,
+    InvoiceDisputed, InvoiceExpired, InvoiceFunded, InvoicePaid, InvoicePartiallyPaid,
+    InvoiceSubmitted, InvoiceTokenChanged, InvoiceTransferred, InvoiceUpdated,
+    LPPositionTransferred, ParameterUpdated, PriceOracleUpdated, QueueTieScoreMarginUpdated,
+    RollbackRehearsalCompleted, SignerRotationCancelled, SignerRotationFinalized,
+    SignerRotationScheduled, TokenAdded, TokenRemoved,
 };
 use invoice::get_last_pause_timestamp;
 use invoice::{
@@ -72,6 +73,7 @@ use invoice::{
     save_queue_resolution, set_lp_score, set_max_invoice_amount, set_min_payer_reputation,
     set_paused, set_payer_score, set_reputation, set_token_volume_cap, try_load_invoice,
     try_set_fund_queue_opened_at, ContractStats, DisputeRecord, ProtocolStatus, StorageKey,
+    get_queue_tie_score_margin, set_queue_tie_score_margin as persist_queue_tie_score_margin,
 };
 // 30-day window in seconds for a payer to file an appeal after a default.
 const APPEAL_WINDOW_SECONDS: u64 = 30 * 24 * 60 * 60;

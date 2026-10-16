@@ -155,4 +155,12 @@ pub enum ContractError {
     /// Issue #1071: the contract's unreserved balance cannot cover a payout
     /// (e.g. after an issuer clawback).
     InsufficientContractBalance = 73,
+    /// Issue #1031: an LP tried to join the fund queue while the queue
+    /// already has at least one entry, and the LP's score does not exceed
+    /// the current best score by the governance-configured tie-score margin.
+    /// The margin is set via `set_queue_tie_score_margin` (admin-only) and
+    /// raises the economic barrier to equal-score manipulation: a fresh LP
+    /// at the default score cannot silently tie with an established LP
+    /// without first building `margin` additional funded invoices.
+    ScoreBelowTieMargin = 74,
 }

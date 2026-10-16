@@ -163,6 +163,13 @@ pub enum DataKey {
     /// Issue #1071/#1072: sum of all `PendingPayout` entries for a token —
     /// reserved balance that new payouts may not spend.
     PendingPayoutTotal(Address),
+    /// Issue #1031: governance-configurable minimum score margin above the
+    /// current queue leader that a new joiner must have.  `0` (default) means
+    /// the pre-existing behaviour is preserved: any score ≥ best_score is
+    /// allowed to join.  A non-zero margin requires a joining LP to score
+    /// `best_score + margin` or higher, raising the economic barrier to
+    /// equal-score manipulation.  Stored as a `u32` in instance storage.
+    QueueTieScoreMargin,
 }
 
 // ----------------------------------------------------------------
@@ -892,4 +899,33 @@ pub fn check_rollback_safety(
     } else {
         Err(crate::errors::ContractError::RollbackUnsafe)
     }
+}
+
+// ----------------------------------------------------------------
+// Issue #1031: Queue Tie-Score Margin helpers
+// ----------------------------------------------------------------
+
+/// Return the current queue tie-score margin (default 0 = disabled).
+///
+/// When > 0, `join_fund_queue` requires a joining LP to have a score of
+/// at least `current_best_score + margin`. This raises the economic barrier
+/// to equal-score manipulation from zero additional invoices to `margin`
+/// additional funded invoices.
+pub fn get_queue_tie_score_margin(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::QueueTieScoreMargin)
+        .unwrap_or(0)
+}
+
+/// Persist a new queue tie-score margin.  The margin is clamped to [0, 50]
+/// so it cannot block legitimate high-reputation LPs from joining (the score
+/// range is 50–100, so a margin > 50 would prevent most LPs from ever
+/// joining a non-empty queue).
+pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
+    // Max useful margin: 50 (half the achievable score range above default).
+    let margin = margin.min(50);
+    env.storage()
+        .instance()
+        .set(&DataKey::QueueTieScoreMargin, &margin);
 }
