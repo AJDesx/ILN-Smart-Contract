@@ -854,11 +854,7 @@ pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequ
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
     let key = StorageKey::FundQueue(invoice_id);
     env.storage().persistent().set(&key, queue);
-    env.storage().persistent().extend_ttl(
-        &key,
-        crate::constants::FUND_QUEUE_TTL_THRESHOLD,
-        crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
-    );
+    extend_queue_key_ttl(env, &key);
 }
 
 /// Return the resolved (approved) funder for an invoice, if any
@@ -872,11 +868,7 @@ pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
     let key = StorageKey::QueueResolution(invoice_id);
     env.storage().persistent().set(&key, approved_lp);
-    env.storage().persistent().extend_ttl(
-        &key,
-        crate::constants::FUND_QUEUE_TTL_THRESHOLD,
-        crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
-    );
+    extend_queue_key_ttl(env, &key);
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
@@ -889,8 +881,22 @@ pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
             .persistent()
             .set(&key, &env.ledger().sequence());
     }
+    extend_queue_key_ttl(env, &key);
+}
+
+/// Keep a fund-queue-related key (`FundQueue`, `FundQueueOpenedAt`,
+/// `QueueResolution`) alive at least until the winner is persisted.
+///
+/// Without this, these entries were written with the default persistent
+/// TTL while `resolve_fund_queue`'s maturity gate relies on
+/// `FundQueueOpenedAt` still being present: if that entry is archived
+/// before `resolve_fund_queue` is called, `get_fund_queue_opened_at`
+/// silently returns `None` and the MEV-mitigation delay (`QUEUE_DELAY_LEDGERS`)
+/// is skipped entirely, letting the queue resolve immediately. Extending the
+/// TTL on every write closes that window.
+fn extend_queue_key_ttl(env: &Env, key: &StorageKey) {
     env.storage().persistent().extend_ttl(
-        &key,
+        key,
         crate::constants::FUND_QUEUE_TTL_THRESHOLD,
         crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
     );
@@ -903,6 +909,74 @@ pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
     env.storage()
         .persistent()
         .get(&StorageKey::FundQueueOpenedAt(invoice_id))
+}
+
+/// Issue #1015: per-key TTL headroom for the fund-queue records that gate
+/// `resolve_fund_queue`'s MEV-mitigation delay (Issue #MEV-1), the
+/// fail-closed archived-state check (Issue #1013), and the pre-upgrade TTL
+/// guard (Issue #1082, `TTL_MIN_LEDGERS_BEFORE_UPGRADE`).
+///
+/// `margin` is `remaining_ttl - TTL_MIN_LEDGERS_BEFORE_UPGRADE`: positive
+/// means the key has at least that much headroom above the threshold the
+/// upgrade guard enforces; zero or negative means it has already drifted
+/// into the zone an upgrade would reject (and, for `FundQueueOpenedAt`
+/// specifically, the zone where an untouched key risks the archived-state
+/// failure). `None` fields mean the corresponding key does not currently
+/// exist (never written, or already evicted).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueTtlMargins {
+    pub fund_queue_ttl: Option<u32>,
+    pub fund_queue_margin: Option<i64>,
+    pub fund_queue_opened_at_ttl: Option<u32>,
+    pub fund_queue_opened_at_margin: Option<i64>,
+    pub queue_resolution_ttl: Option<u32>,
+    pub queue_resolution_margin: Option<i64>,
+}
+
+/// Issue #1015: measure the live TTL (and margin above
+/// `TTL_MIN_LEDGERS_BEFORE_UPGRADE`) for each fund-queue-related persistent
+/// key of `invoice_id`, so operators can monitor queue health and catch TTL
+/// drift before it causes an upgrade rejection (Issue #1082) or a
+/// `QueueStateArchived` failure (Issue #1013), rather than finding out only
+/// when one of those checks actually fires.
+pub fn get_fund_queue_ttl_margins(env: &Env, invoice_id: u64) -> FundQueueTtlMargins {
+    let threshold = crate::constants::TTL_MIN_LEDGERS_BEFORE_UPGRADE as i64;
+
+    let fq_key = StorageKey::FundQueue(invoice_id);
+    let (fund_queue_ttl, fund_queue_margin) = if env.storage().persistent().has(&fq_key) {
+        let ttl = env.storage().persistent().get_ttl(&fq_key);
+        (Some(ttl), Some(ttl as i64 - threshold))
+    } else {
+        (None, None)
+    };
+
+    let fqoa_key = StorageKey::FundQueueOpenedAt(invoice_id);
+    let (fund_queue_opened_at_ttl, fund_queue_opened_at_margin) =
+        if env.storage().persistent().has(&fqoa_key) {
+            let ttl = env.storage().persistent().get_ttl(&fqoa_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    let qr_key = StorageKey::QueueResolution(invoice_id);
+    let (queue_resolution_ttl, queue_resolution_margin) =
+        if env.storage().persistent().has(&qr_key) {
+            let ttl = env.storage().persistent().get_ttl(&qr_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    FundQueueTtlMargins {
+        fund_queue_ttl,
+        fund_queue_margin,
+        fund_queue_opened_at_ttl,
+        fund_queue_opened_at_margin,
+        queue_resolution_ttl,
+        queue_resolution_margin,
+    }
 }
 // Contract stats helpers
 // ----------------------------------------------------------------

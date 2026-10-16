@@ -100,16 +100,9 @@ silent data loss without any on-chain indication:
 |-----|---------------|-----------------------|
 | `InvoiceCore(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
 | `InvoiceMetadata(u64)` | `storage::save_invoice` | 1,000,000 / 2,000,000 ledgers |
-| `FundQueue(u64)` | `storage::save_fund_queue` / `invoice::save_fund_queue` | 1,000,000 / 2,000,000 ledgers |
-| `FundQueueOpenedAt(u64)` | `storage::try_set_fund_queue_opened_at` / `invoice::try_set_fund_queue_opened_at` | 1,000,000 / 2,000,000 ledgers |
-| `QueueResolution(u64)` | `storage::save_queue_resolution` / `invoice::save_queue_resolution` | 1,000,000 / 2,000,000 ledgers |
-
-**Maximum depth extension cost (Issue #1025):** The LP priority queue is bounded
-at `MAX_FUND_QUEUE_LEN` = 50. Benchmarks measure the cost of extending/displacing
-entries at maximum depth (1,124,580 CPU instructions, 42,350 memory bytes) and
-resolving the queue (582,140 CPU, 28,120 bytes). Direct storage extension of a full
-50-entry queue requires 321,850 CPU and 16,420 bytes, safely within Soroban per-tx
-budgets while ensuring all protocol-critical queue keys remain live.
+| `FundQueue(u64)` | `invoice::save_fund_queue` | 1,000,000 / 2,000,000 ledgers |
+| `FundQueueOpenedAt(u64)` | `invoice::try_set_fund_queue_opened_at` | 1,000,000 / 2,000,000 ledgers |
+| `QueueResolution(u64)` | `invoice::save_queue_resolution` | 1,000,000 / 2,000,000 ledgers |
 
 **Pre-upgrade TTL guard:** `upgrade()` calls
 `storage::validate_ttl_fields_pre_upgrade()` before swapping the WASM binary.
@@ -119,6 +112,87 @@ TTL below `TTL_MIN_LEDGERS_BEFORE_UPGRADE` (500,000 ledgers ≈ 29 days), the
 upgrade is **rejected fail-closed** with
 `ContractError::UpgradeRemovesTtlFields` (code 50). The admin must refresh the
 affected entries by re-invoking the relevant storage helper before retrying.
+
+> **Note on the "TTL managed by" column:** the functions named above are the
+> ones in `invoice.rs` that `lib.rs` actually imports and calls from
+> `join_fund_queue` / `resolve_fund_queue`. `storage.rs` also defines a
+> second, identically-named set of `get_fund_queue` / `save_fund_queue` /
+> `get_queue_resolution` / `save_queue_resolution` /
+> `try_set_fund_queue_opened_at` / `get_fund_queue_opened_at` helpers (keyed
+> off the same `DataKey` enum, re-exported as `StorageKey` in `invoice.rs`);
+> those are **not called from anywhere** and exist only as an earlier,
+> superseded draft of the fix described below. Do not add new callers of the
+> `storage.rs` copies — extend the `invoice.rs` ones instead, and prefer
+> deleting the dead copies entirely in any follow-up cleanup.
+
+### Queued-entry retention guarantees (Issues #1011, #1013, #1015, #1016)
+
+`resolve_fund_queue`'s MEV-mitigation delay (Issue #MEV-1, `QUEUE_DELAY_LEDGERS`
+= 120 ledgers ≈ 10 minutes) depends entirely on `FundQueueOpenedAt(id)` still
+being readable when someone calls `resolve_fund_queue`. The queue itself
+(`FundQueue(id)`) and the eventual winner record (`QueueResolution(id)`) carry
+the same requirement — losing any of the three mid-flight is silent data loss
+for an invoice that may still be actively fundable.
+
+**Before (pre-#1011):** `invoice::save_fund_queue`,
+`invoice::try_set_fund_queue_opened_at`, and `invoice::save_queue_resolution`
+— the versions actually wired into `join_fund_queue` / `resolve_fund_queue` —
+wrote these three keys with Soroban's default persistent TTL and never called
+`extend_ttl`. A TTL-safe version of the same three functions existed in
+`storage.rs` (written for Issue #1091) but was never imported or called by
+`lib.rs`, so it provided no protection in practice. A queue that sat open for
+longer than the default TTL (e.g. an invoice nobody resolved promptly) could
+have its `FundQueueOpenedAt` entry archived before `resolve_fund_queue` ran.
+Because the maturity check was written as
+`if let Some(opened_at) = get_fund_queue_opened_at(...) { ... }`, a missing
+entry **silently skipped the delay check entirely** — fail-open — letting the
+queue resolve immediately with no MEV protection, rather than surfacing the
+lost record as an error.
+
+**After:**
+- **Retention (#1011):** `invoice::save_fund_queue`,
+  `invoice::try_set_fund_queue_opened_at`, and `invoice::save_queue_resolution`
+  each call `extend_ttl(key, FUND_QUEUE_TTL_THRESHOLD, FUND_QUEUE_TTL_EXTEND_TO)`
+  = `(1_000_000, 2_000_000)` ledgers on every write — the same policy
+  `save_invoice` already applies to `InvoiceCore`/`InvoiceMetadata`. Every LP
+  join refreshes `FundQueueOpenedAt`'s TTL even though its *value* is only set
+  once, so a queue that keeps receiving joins never drifts toward expiry, and
+  even a queue frozen right after it opens has ~1,000,000+ ledgers (~58+ days
+  at 5s/ledger) of headroom before the pre-upgrade threshold, let alone actual
+  archival.
+- **Fail-closed on loss anyway (#1013):** `resolve_fund_queue` no longer
+  treats a missing `FundQueueOpenedAt` as "no gate required." Since the queue
+  is already confirmed non-empty at that point in the function, a missing
+  entry can only mean it was archived or otherwise lost — never that no LP
+  ever joined. That case now returns
+  `ContractError::QueueStateArchived` (code 75) and publishes a
+  `queue_resolve_attempt` event with `success: false`, instead of silently
+  granting an unprotected resolution.
+- **Instrumentation (#1015):** a new read-only contract method,
+  `get_fund_queue_ttl_margins(invoice_id) -> FundQueueTtlMargins`, reports the
+  live TTL and the margin above `TTL_MIN_LEDGERS_BEFORE_UPGRADE` for each of
+  the three keys (`None` when a key doesn't exist). Operators can poll this
+  per-invoice to catch TTL drift before it ever reaches the upgrade guard
+  (#1082) or the `QueueStateArchived` failure path (#1013) — see
+  [`docs/exploit-pattern-monitoring.md`](exploit-pattern-monitoring.md).
+
+**Guarantee going forward:** as long as at least one `join_fund_queue` call
+has ever succeeded for an invoice, `FundQueue(id)` and `FundQueueOpenedAt(id)`
+are retained for ≥1,000,000 ledgers from that call, and `QueueResolution(id)`
+is retained for ≥1,000,000 ledgers from `resolve_fund_queue` succeeding. If an
+entry is ever found missing despite this (e.g. stale state written before
+this fix shipped), `resolve_fund_queue` fails closed rather than silently
+dropping the MEV-mitigation delay.
+
+**Migration note:** this is a behavior-only fix — no storage layout or key
+format changed, so no data migration is required. The one operational
+follow-up: any invoice whose fund queue was opened *before* this fix deployed
+and has not received a new `join_fund_queue` call since will still be sitting
+on its pre-fix (un-extended) TTL. Operators should run
+`get_fund_queue_ttl_margins` across invoices with an open, unresolved queue
+after deploying this fix and, for any with a low or negative margin, prompt a
+new LP join (or have the admin re-invoke the relevant `invoice::save_*`
+helper) to refresh the TTL before it actually expires.
 
 ---
 
