@@ -55,6 +55,7 @@ pub const QUEUE_DELAY_LEDGERS: u32 = 120;
 /// resolution.
 pub const MAX_FUND_QUEUE_LEN: u32 = 50;
 
+
 /// Issue #1091: TTL policy for the fund-queue keys (`FundQueue`,
 /// `FundQueueOpenedAt`, `QueueResolution`). Matches the invoice's own
 /// `extend_ttl(1_000_000, 2_000_000)` in `storage::save_invoice` so the

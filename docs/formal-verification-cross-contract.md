@@ -104,7 +104,37 @@ insurance twice for one invoice.
 
 ---
 
-## 7. Residual risks
+## 7. Invariant X6 — Allowlisted tokens always carry decimals (fail closed)
+
+**Property:** Every token for which `is_approved_token` is true has a
+`TokenDecimals` entry (USDC=6, EURC=6, XLM=7 after `initialize`; any
+`add_token` token whose declared decimals match its own `decimals()` and are
+`<= MAX_TOKEN_DECIMALS`, see `token_safety.rs` / Issue #1070). If an entry is
+absent, `submit_invoice` returns `TokenDecimalsNotConfigured` and consumes no
+invoice id — there is no silent 6-decimal fallback.
+
+**Why cross-contract:** the minimum-amount floor and every downstream token
+transfer in distribution / insurance are denominated in the token's own
+precision; assuming 6 for a 7-decimal asset under-enforces the floor 10×.
+
+**Verified by:** `c1_*` in `contracts/tests/audit_regression_test.rs`
+(registration/bounds paths: `tests_token_safety.rs`)
+
+---
+
+## 8. Invariant X7 — Fund queue state is bounded
+
+**Property:** For every invoice, `|FundQueue(invoice_id)| <= MAX_FUND_QUEUE_LEN`.
+At capacity a joiner is admitted only if its score strictly exceeds the
+lowest queued score (displacing that entry and emitting
+`fund_queue_displaced`); otherwise `QueueFull`. Resolution remains O(1)
+(`queue[0]`) and picks the highest score.
+
+**Verified by:** `c3_*` in `contracts/tests/audit_regression_test.rs`
+
+---
+
+## 9. Residual risks
 
 - Distribution rates of zero trivially satisfy X1/X2 with “no increase”; tests
   use positive default rates after `initialize`.
@@ -113,7 +143,7 @@ insurance twice for one invoice.
 - Governance and `reputation_bonus` are out of scope here (covered by the
   full-protocol lifecycle test and Part II of `formal-verification.md`).
 
-## 8. Coverage
+## 10. Coverage
 
 | Invariant | Verified by |
 |-----------|-------------|
@@ -122,3 +152,8 @@ insurance twice for one invoice.
 | X3 Default claim vs pool balance | `x3_default_claim_reduces_insurance_pool_by_payout` |
 | X4 Token conservation | `x4_payment_token_conserved_across_iln_and_insurance` |
 | X5 No double insurance pay | `x5_insurance_compensation_not_paid_twice_for_same_invoice` |
+| X6 Token decimals present / bounded | `c1_*` (`audit_regression_test`) |
+| X7 Bounded fund queue | `c3_*` (`audit_regression_test`) |
+
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md)
+for the evidence → control → test mapping.

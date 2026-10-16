@@ -2076,6 +2076,27 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             }
         }
 
+        // Issue #1095: the queue is bounded. When full, a joiner must strictly
+        // outscore the lowest-scored entry (the tail, since the queue is sorted
+        // descending) and displaces it; otherwise the join is rejected.
+        if queue.len() >= crate::constants::MAX_FUND_QUEUE_LEN {
+            let tail = queue.last().ok_or(ContractError::QueueFull)?;
+            if score <= tail.score {
+                return Err(ContractError::QueueFull);
+            }
+            queue.pop_back();
+            env.events().publish(
+                (Symbol::new(&env, "fund_queue_displaced"), invoice_id),
+                crate::events::FundQueueEntryDisplaced {
+                    invoice_id,
+                    displaced_lp: tail.lp,
+                    displaced_score: tail.score,
+                    new_lp: lp.clone(),
+                    new_score: score,
+                },
+            );
+        }
+
         queue.insert(insert_pos, new_request);
         save_fund_queue(&env, invoice_id, &queue);
 
