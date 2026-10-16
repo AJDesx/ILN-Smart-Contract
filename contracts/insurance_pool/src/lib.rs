@@ -31,7 +31,7 @@ pub use insurance_interface::{
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, BytesN, Env,
+    Address, BytesN, Env, IntoVal, Symbol, Val,
 };
 
 /// Minimum defaults on a single (lp, payer) pair before the collusion
@@ -177,6 +177,12 @@ pub enum DataKey {
     /// reputation reads (ADR-015). If not set, premium calculation
     /// ignores reputation scores.
     ReputationContract,
+    /// Proposed risk multiplier numerator awaiting timelock expiry (Issue #528).
+    PendingRiskMultiplierNumerator,
+    /// Proposed risk multiplier denominator awaiting timelock expiry (Issue #528).
+    PendingRiskMultiplierDenominator,
+    /// Ledger timestamp at which the pending risk multiplier becomes executable.
+    RiskMultiplierEta,
 }
 
 /// Solvency snapshot returned by `get_pool_health`, so LPs can judge
@@ -668,10 +674,10 @@ pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
 
         // Cross-contract call: reputation_bonus.get_reputation(lp) → ReputationScore
         // We only need the `score` field (0–100).
-        let args = soroban_sdk::vec![&env, soroban_sdk::IntoVal::into_val(&lp, &env)];
-        let result = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+        let args = soroban_sdk::vec![&env, lp.into_val(&env)];
+        let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &rep_contract,
-            &soroban_sdk::Symbol::new(&env, "get_reputation"),
+            &Symbol::new(&env, "get_reputation"),
             args,
         );
 
