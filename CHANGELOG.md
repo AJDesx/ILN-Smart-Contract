@@ -12,7 +12,7 @@ To regenerate: `make changelog`
 
 ## Unreleased
 
-- fix(contract): fail closed when a token has no registered decimals; register EURC decimals at `initialize`; bound `add_token` decimals (#1094)
+- test(contract): regression guards for fail-closed token decimals (decimals logic itself landed in #1070) (#1094)
 - fix(contract): enforce `MAX_FUND_QUEUE_LEN` in `join_fund_queue` with strict-score displacement (#1095)
 - test: audit-path regression suite `audit_regression_test` (#1096)
 - docs: evidence → remediation control map (#1097)

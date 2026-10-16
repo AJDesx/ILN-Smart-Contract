@@ -1,4 +1,4 @@
-//! Issues #1094, #1095, #1096 — regression suite for the formal-verification
+//! Issues #1094 (guards on #1070's fail-closed decimals), #1095, #1096 — regression suite for the formal-verification
 //! audit paths (docs/formal-verification.md,
 //! docs/formal-verification-cross-contract.md,
 //! contracts/tests/cross_contract_invariants_test.rs).
@@ -8,7 +8,6 @@
 //! Run: `cargo test -p invoice_liquidity --test audit_regression_test`
 //!
 //!  - C1  token decimals are present for every allowlisted token (fail closed)
-//!  - C2  `add_token` bounds decimals
 //!  - C3  the LP fund queue is bounded and displacement is strictly score-ordered
 
 #![cfg(test)]
@@ -16,7 +15,7 @@
 extern crate std;
 
 use invoice_liquidity::{
-    constants::{MAX_FUND_QUEUE_LEN, MAX_TOKEN_DECIMALS, QUEUE_DELAY_LEDGERS},
+    constants::{MAX_FUND_QUEUE_LEN, QUEUE_DELAY_LEDGERS},
     ContractError, DataKey, InvoiceLiquidityContract, InvoiceLiquidityContractClient, ReferralCode,
 };
 use soroban_sdk::{
@@ -133,7 +132,7 @@ fn c1_missing_decimals_fails_closed_instead_of_assuming_six() {
     assert_eq!(t.contract.get_token_decimals(&t.token.address), None);
     assert_eq!(
         submit(&t, &t.token.address),
-        Err(ContractError::TokenDecimalsMissing)
+        Err(ContractError::TokenDecimalsNotConfigured)
     );
     // No invoice id was consumed by the rejected submission.
     assert_eq!(t.contract.get_invoice_count(), 0);
@@ -144,17 +143,6 @@ fn c1_unlisted_token_still_unauthorized_not_decimals_error() {
     let t = setup();
     let rogue = Address::generate(&t.env);
     assert_eq!(submit(&t, &rogue), Err(ContractError::Unauthorized));
-}
-
-// ── C2: decimals bound (#1094) ───────────────────────────────────────────────
-
-#[test]
-fn c2_add_token_rejects_decimals_above_max() {
-    let t = setup();
-    let tok = Address::generate(&t.env);
-    let res = t.contract.try_add_token(&tok, &(MAX_TOKEN_DECIMALS + 1));
-    assert_eq!(res, Err(Ok(ContractError::InvalidTokenDecimals)));
-    assert_eq!(t.contract.get_token_decimals(&tok), None);
 }
 
 // ── C3: bounded fund queue (#1095) ───────────────────────────────────────────

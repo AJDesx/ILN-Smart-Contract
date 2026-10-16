@@ -6,7 +6,7 @@ pub const CONTRACT_VERSION: &str = "1.0.0";
 /// Issue #539: Current storage schema version. Bump this whenever the
 /// persistent/instance storage layout changes so that `migrate()` can
 /// detect and apply incremental upgrades.
-pub const CURRENT_STORAGE_VERSION: u32 = 2;
+pub const CURRENT_STORAGE_VERSION: u32 = 3;
 
 // ----------------------------------------------------------------
 // Rate Limiting Defaults (Issue #541)
@@ -55,9 +55,6 @@ pub const QUEUE_DELAY_LEDGERS: u32 = 120;
 /// resolution.
 pub const MAX_FUND_QUEUE_LEN: u32 = 50;
 
-/// Issue #1094: upper bound on a registered token's decimal precision.
-/// 10^18 fits comfortably in i128 and covers every Stellar/EVM-style asset.
-pub const MAX_TOKEN_DECIMALS: u32 = 18;
 
 /// Issue #1091: TTL policy for the fund-queue keys (`FundQueue`,
 /// `FundQueueOpenedAt`, `QueueResolution`). Matches the invoice's own

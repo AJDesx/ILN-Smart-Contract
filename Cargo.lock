@@ -930,7 +930,9 @@ dependencies = [
 name = "iln_governance"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "reputation_bonus",
+ "serde_json",
  "soroban-sdk",
 ]
 

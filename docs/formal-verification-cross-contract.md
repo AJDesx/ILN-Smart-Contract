@@ -17,6 +17,13 @@ suites — those cannot see foreign contract storage.
 **Harness:** `contracts/tests/cross_contract_invariants_test.rs`  
 **Run:** `cargo test -p invoice_liquidity --test cross_contract_invariants_test`
 
+**Published registry (Issue #1100):** the binding obligation↔test mapping is
+machine-readable in [`proof-obligations.json`](proof-obligations.json), described
+in [`proof-obligations.md`](proof-obligations.md), and validated against the tree
+by `scripts/check-proof-obligations.py` and
+`contracts/iln_governance/src/tests_proof_obligations.rs`. Any change to the
+invariants below must update the registry too (the check fails otherwise).
+
 ---
 
 ## 2. Invariant X1 — Funding notifies distribution (when wired)
@@ -101,15 +108,17 @@ insurance twice for one invoice.
 
 **Property:** Every token for which `is_approved_token` is true has a
 `TokenDecimals` entry (USDC=6, EURC=6, XLM=7 after `initialize`; any
-`add_token` token with `decimals <= MAX_TOKEN_DECIMALS`). If an entry is
-absent, `submit_invoice` returns `TokenDecimalsMissing` and consumes no
+`add_token` token whose declared decimals match its own `decimals()` and are
+`<= MAX_TOKEN_DECIMALS`, see `token_safety.rs` / Issue #1070). If an entry is
+absent, `submit_invoice` returns `TokenDecimalsNotConfigured` and consumes no
 invoice id — there is no silent 6-decimal fallback.
 
 **Why cross-contract:** the minimum-amount floor and every downstream token
 transfer in distribution / insurance are denominated in the token's own
 precision; assuming 6 for a 7-decimal asset under-enforces the floor 10×.
 
-**Verified by:** `c1_*`, `c2_*` in `contracts/tests/audit_regression_test.rs`
+**Verified by:** `c1_*` in `contracts/tests/audit_regression_test.rs`
+(registration/bounds paths: `tests_token_safety.rs`)
 
 ---
 
@@ -143,7 +152,7 @@ lowest queued score (displacing that entry and emitting
 | X3 Default claim vs pool balance | `x3_default_claim_reduces_insurance_pool_by_payout` |
 | X4 Token conservation | `x4_payment_token_conserved_across_iln_and_insurance` |
 | X5 No double insurance pay | `x5_insurance_compensation_not_paid_twice_for_same_invoice` |
-| X6 Token decimals present / bounded | `c1_*`, `c2_*` (`audit_regression_test`) |
+| X6 Token decimals present / bounded | `c1_*` (`audit_regression_test`) |
 | X7 Bounded fund queue | `c3_*` (`audit_regression_test`) |
 
 See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md)
