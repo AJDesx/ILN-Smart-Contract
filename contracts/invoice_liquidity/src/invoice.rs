@@ -1096,3 +1096,32 @@ pub fn get_last_pause_timestamp(env: &Env) -> u64 {
         .get(&StorageKey::LastPauseTimestamp)
         .unwrap_or(0)
 }
+
+// ----------------------------------------------------------------
+// Issue #1031: Queue Tie-Score Margin helpers
+// ----------------------------------------------------------------
+
+/// Return the current queue tie-score margin (default 0 = disabled).
+///
+/// When non-zero, `join_fund_queue` requires the joining LP to have a score
+/// of at least `current_best_score + margin`, rather than simply ≥ best_score.
+/// This raises the economic barrier to equal-score manipulation: an attacker
+/// at the default score cannot silently tie with an established LP without
+/// first building `margin` additional funded-invoice history.
+///
+/// Score range: 50 (default) to 100 (max). A margin > 50 is clamped to 50 by
+/// `set_queue_tie_score_margin` to avoid blocking legitimate high-rep LPs.
+pub fn get_queue_tie_score_margin(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::QueueTieScoreMargin)
+        .unwrap_or(0)
+}
+
+/// Persist a new queue tie-score margin. Clamped to [0, 50].
+pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
+    let margin = margin.min(50);
+    env.storage()
+        .instance()
+        .set(&StorageKey::QueueTieScoreMargin, &margin);
+}

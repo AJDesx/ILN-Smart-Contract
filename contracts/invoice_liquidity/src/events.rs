@@ -625,3 +625,48 @@ pub struct RollbackRehearsalCompleted {
     pub report: RollbackRehearsalReport,
     pub timestamp: u64,
 }
+
+// ----------------------------------------------------------------
+// Issue #1031: Equal-score manipulation economics simulation
+// ----------------------------------------------------------------
+
+/// Emitted by `simulate_equal_score_attack()`.
+///
+/// Describes the economic cost–benefit breakdown of an equal-score
+/// queue manipulation attempt. Off-chain analytics and dashboards can
+/// consume this event to monitor whether the configured `tie_score_margin`
+/// is producing an adequate deterrent.
+///
+/// # Fields
+/// * `attacker_score`     — score the simulated attacker starts with
+/// * `defender_score`     — score of the legitimate LP being challenged
+/// * `n_attackers`        — number of colluding attacker accounts in the simulation
+/// * `invoices_to_tie`    — funded invoices needed to reach `defender_score`
+///                          (0 when `attacker_score >= defender_score`)
+/// * `invoices_to_beat`   — funded invoices needed to outscore `defender_score`
+///                          by at least 1 (including any active `tie_score_margin`)
+/// * `tie_win_probability_pct` — expected win rate at `defender_score` with
+///                          `n_attackers` colluding (0 when margin prevents joining)
+/// * `tie_score_margin`   — active margin at simulation time
+/// * `attacker_can_join`  — `true` iff the attacker score satisfies the margin
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EqualScoreManipulationSimulated {
+    pub attacker_score: u32,
+    pub defender_score: u32,
+    pub n_attackers: u32,
+    pub invoices_to_tie: u32,
+    pub invoices_to_beat: u32,
+    pub tie_win_probability_pct: u32,
+    pub tie_score_margin: u32,
+    pub attacker_can_join: bool,
+}
+
+/// Emitted by `set_queue_tie_score_margin()` when an admin updates the margin.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueTieScoreMarginUpdated {
+    pub old_margin: u32,
+    pub new_margin: u32,
+    pub updated_by: Address,
+}
