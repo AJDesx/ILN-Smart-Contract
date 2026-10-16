@@ -34,8 +34,8 @@ use oracle_registry::OracleFeedType;
 use twap_accumulator::{get_twap, record_observation, TWAPError};
 
 pub use crate::invoice::{
-    AppealRecord, Invoice, InvoiceParams, InvoiceStatus, LpFundRequest, ReferralCode,
-    ReputationProfile, ReputationScore, TopPayerEntry,
+    AppealRecord, FundQueueTtlMargins, Invoice, InvoiceParams, InvoiceStatus, LpFundRequest,
+    ReferralCode, ReputationProfile, ReputationScore, TopPayerEntry,
 };
 pub use crate::nft::InvoiceNftMetadata;
 pub use crate::storage::DataKey;
@@ -2214,22 +2214,43 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         // that all LPs have a fair window to join before the winner is locked.
         // The delay is measured in ledger sequences (not timestamps) because
         // ledger sequence is monotonically increasing and cannot be manipulated.
-        if let Some(opened_at) = get_fund_queue_opened_at(&env, invoice_id) {
-            let current = env.ledger().sequence();
-            if current < opened_at.saturating_add(QUEUE_DELAY_LEDGERS) {
-                // Emit an attempt event so off-chain monitors can detect MEV
-                // probing even on rejected calls.
+        //
+        // Issue #1013: fail closed, not open, when this record is missing.
+        // The queue checked above is non-empty, so `try_set_fund_queue_opened_at`
+        // must have run when the first LP joined — `FundQueueOpenedAt` can only
+        // be absent here if it was archived (TTL lapsed) or otherwise lost, not
+        // because no delay was ever required. Previously a missing record fell
+        // through this gate silently, letting the queue resolve immediately
+        // with no MEV-mitigation wait at all; now it is rejected instead.
+        let current = env.ledger().sequence();
+        let opened_at = match get_fund_queue_opened_at(&env, invoice_id) {
+            Some(opened_at) => opened_at,
+            None => {
                 env.events().publish(
                     (Symbol::new(&env, "queue_resolve_attempt"), invoice_id),
                     FundQueueResolutionAttempted {
                         invoice_id,
-                        caller_ledger: opened_at,
+                        caller_ledger: 0,
                         attempted_at_ledger: current,
                         success: false,
                     },
                 );
-                return Err(ContractError::QueueNotMature);
+                return Err(ContractError::QueueStateArchived);
             }
+        };
+        if current < opened_at.saturating_add(QUEUE_DELAY_LEDGERS) {
+            // Emit an attempt event so off-chain monitors can detect MEV
+            // probing even on rejected calls.
+            env.events().publish(
+                (Symbol::new(&env, "queue_resolve_attempt"), invoice_id),
+                FundQueueResolutionAttempted {
+                    invoice_id,
+                    caller_ledger: opened_at,
+                    attempted_at_ledger: current,
+                    success: false,
+                },
+            );
+            return Err(ContractError::QueueNotMature);
         }
 
         // Queue is sorted by score (descending), so the highest score is at
@@ -2301,6 +2322,16 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         );
 
         Ok(best_lp)
+    }
+
+    /// Issue #1015: report the current TTL (and margin above the pre-upgrade
+    /// safety threshold) for `invoice_id`'s fund-queue-related persistent
+    /// keys, so off-chain monitors can alert on TTL drift before it causes
+    /// an upgrade rejection (Issue #1082) or a `QueueStateArchived` failure
+    /// in `resolve_fund_queue` (Issue #1013).
+    /// Access: Anyone
+    pub fn get_fund_queue_ttl_margins(env: Env, invoice_id: u64) -> FundQueueTtlMargins {
+        crate::invoice::get_fund_queue_ttl_margins(&env, invoice_id)
     }
 
     // ------------------------------------------------------------

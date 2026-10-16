@@ -163,4 +163,11 @@ pub enum ContractError {
     /// at the default score cannot silently tie with an established LP
     /// without first building `margin` additional funded invoices.
     ScoreBelowTieMargin = 74,
+    /// Issue #1013: `resolve_fund_queue` found a non-empty fund queue but no
+    /// `FundQueueOpenedAt` record for it. That record is only ever absent for
+    /// a non-empty queue if it was archived (TTL lapsed) or otherwise lost —
+    /// never because no LP had joined. Previously this case silently skipped
+    /// the MEV-mitigation maturity delay instead of rejecting the call; it is
+    /// now a hard failure so corrupted/archived queue state fails closed.
+    QueueStateArchived = 75,
 }
