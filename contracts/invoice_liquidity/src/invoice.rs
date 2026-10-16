@@ -850,7 +850,7 @@ pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequ
         .unwrap_or(soroban_sdk::Vec::new(env))
 }
 
-/// Persist the queue
+/// Persist the queue and extend its TTL (Issue #1025, #1091)
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
     let key = StorageKey::FundQueue(invoice_id);
     env.storage().persistent().set(&key, queue);
@@ -864,7 +864,7 @@ pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
         .get(&StorageKey::QueueResolution(invoice_id))
 }
 
-/// Store the approved funder chosen by the priority queue
+/// Store the approved funder chosen by the priority queue and extend its TTL (Issue #1025, #1091)
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
     let key = StorageKey::QueueResolution(invoice_id);
     env.storage().persistent().set(&key, approved_lp);
@@ -873,7 +873,7 @@ pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) 
 
 /// Record the ledger sequence when the first LP joined the fund queue.
 /// Called once when the queue transitions from empty to non-empty.
-/// Subsequent joins do not overwrite this value.
+/// Subsequent joins do not overwrite this value. Extends TTL (Issue #1025, #1091).
 pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
     let key = StorageKey::FundQueueOpenedAt(invoice_id);
     if !env.storage().persistent().has(&key) {
