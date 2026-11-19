@@ -372,6 +372,76 @@ fn admin_transfer_can_be_cancelled() {
     assert_eq!(res, Err(Ok(InsuranceError::NoPendingProposal)));
 }
 
+// ── Issue #1265: admin transfer acceptance and initialization ownership ──
+
+#[test]
+fn admin_transfer_execution_requires_pending_admin_auth() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    let eta = s.client.propose_admin_transfer(&new_admin);
+    s.env.ledger().set_timestamp(eta);
+    s.client.execute_admin_transfer();
+
+    // The acceptance was authorized by the pending admin, not by an
+    // arbitrary caller.
+    assert!(s
+        .env
+        .auths()
+        .iter()
+        .any(|(addr, _)| *addr == new_admin));
+}
+
+#[test]
+fn admin_transfer_without_pending_admin_signature_keeps_current_admin() {
+    let s = setup();
+    let unreachable_admin = Address::generate(&s.env);
+
+    let eta = s.client.propose_admin_transfer(&unreachable_admin);
+    s.env.ledger().set_timestamp(eta);
+
+    // Nobody signs: the transfer must not happen.
+    s.env.set_auths(&[]);
+    assert!(s.client.try_execute_admin_transfer().is_err());
+
+    // The proposal is still pending and the current admin can still act
+    // (cancel), so the pool never ends up without an authorized owner.
+    assert_eq!(
+        s.client.get_pending_admin(),
+        Some((unreachable_admin.clone(), eta))
+    );
+    s.env.mock_all_auths();
+    s.client.cancel_admin_transfer();
+    assert_eq!(s.client.get_pending_admin(), None);
+}
+
+#[test]
+fn initialize_requires_admin_auth_and_rejects_reinitialization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InsurancePool);
+    let client = InsurancePoolClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    // No signature from `admin`: initialization fails and writes nothing.
+    assert!(client.try_initialize(&admin, &COVERAGE, &token).is_err());
+    assert_eq!(
+        client.try_get_token_address(),
+        Err(Ok(InsuranceError::NotInitialized))
+    );
+
+    env.mock_all_auths();
+    client.initialize(&admin, &COVERAGE, &token);
+
+    let other = Address::generate(&env);
+    assert_eq!(
+        client.try_initialize(&other, &COVERAGE, &token),
+        Err(Ok(InsuranceError::AlreadyInitialized))
+    );
+}
+
 // ── Governance-controlled parameter updates ────────────────────────────────
 
 #[test]
