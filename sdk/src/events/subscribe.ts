@@ -464,7 +464,7 @@ export function subscribe(
               try {
                 const replayStartLedger = lastProcessedLedger + 1;
                 await replay(horizon, contractId, filter, replayStartLedger, (replayEv) => {
-                  if (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken)) {
+                  if (stopped || (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken))) {
                     return;
                   }
                   if (matchesFilter(replayEv, filter)) {
@@ -473,12 +473,12 @@ export function subscribe(
                   trackEvent(replayEv);
                 });
               } catch (replayErr) {
-                onError?.(replayErr);
+                if (!stopped) onError?.(replayErr);
               }
             }
 
             // Final deduplication check after potential replay catch-up
-            if (event.pagingToken && processedTokens.has(event.pagingToken)) {
+            if (stopped || (event.pagingToken && processedTokens.has(event.pagingToken))) {
               return;
             }
 
@@ -520,7 +520,7 @@ export function subscribe(
   // Handle optional initial event replay
   if (filter.fromLedger !== undefined) {
     replay(horizon, contractId, filter, filter.fromLedger, (replayEv) => {
-      if (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken)) {
+      if (stopped || (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken))) {
         return;
       }
       if (matchesFilter(replayEv, filter)) {
@@ -536,8 +536,8 @@ export function subscribe(
         connect();
       })
       .catch((err) => {
-        onError?.(err);
         if (!stopped) {
+          onError?.(err);
           connect();
         }
       });
