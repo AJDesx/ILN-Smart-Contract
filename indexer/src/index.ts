@@ -24,7 +24,11 @@ const chainReader = config.contractId
     })
   : undefined;
 
-const app = createApp(db, { apiKeys: config.apiKeys, chainReader });
+const app = createApp(db, {
+  apiKeys: config.apiKeys,
+  ...(chainReader ? { chainReader } : {}),
+  ...(config.trustProxy !== undefined ? { trustProxy: config.trustProxy } : {}),
+});
 const eventRepository = createSqlEventRepository(db);
 const eventListener = createEventListener({
   repository: eventRepository,
