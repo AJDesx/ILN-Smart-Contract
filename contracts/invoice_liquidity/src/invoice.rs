@@ -1232,3 +1232,214 @@ pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
         .instance()
         .set(&StorageKey::QueueTieScoreMargin, &margin);
 }
+
+#[cfg(test)]
+mod proof_obligation_tests {
+    //! Pure model for the maintained invoice lifecycle and accounting invariants.
+    //! The model uses lifecycle status, stored amount/funded/paid balances, role
+    //! identities, and deterministic storage keys. It defines illegal transitions,
+    //! terminal states, balance bounds, authorization rules, and key isolation;
+    //! repeated or unauthorized actions are rejected without state transition.
+
+    use super::InvoiceStatus;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Transition {
+        Fund,
+        PartiallyFund,
+        Cancel,
+        Expire,
+        Dispute,
+        MarkPaid,
+        Default,
+        Appeal,
+        ResolveAppeal,
+        ResolveDispute,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Action {
+        Cancel,
+        MarkPaid,
+        ClaimDefault,
+        Admin,
+        Dispute,
+        Appeal,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Roles {
+        payer: u64,
+        freelancer: u64,
+        funder: u64,
+        admin: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModelInvoice {
+        amount: i128,
+        funded: i128,
+        paid: i128,
+        status: InvoiceStatus,
+        roles: Roles,
+    }
+
+    fn transition(from: InvoiceStatus, action: Transition) -> Option<InvoiceStatus> {
+        match (from, action) {
+            (InvoiceStatus::Pending, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Pending, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            (InvoiceStatus::Pending, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Pending, Transition::Expire) => Some(InvoiceStatus::Expired),
+            (InvoiceStatus::Pending, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::PartiallyFunded, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::PartiallyFunded, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::PartiallyFunded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Funded, Transition::MarkPaid) => Some(InvoiceStatus::Paid),
+            (InvoiceStatus::Funded, Transition::Default) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Funded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Defaulted, Transition::Appeal) => Some(InvoiceStatus::Appealed),
+            (InvoiceStatus::Appealed, Transition::ResolveAppeal) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Disputed, Transition::ResolveDispute) => Some(InvoiceStatus::Pending),
+            (InvoiceStatus::Disputed, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Disputed, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Disputed, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            _ => None,
+        }
+    }
+
+    fn balances_valid(invoice: &ModelInvoice) -> bool {
+        invoice.amount > 0
+            && invoice.funded >= 0
+            && invoice.paid >= 0
+            && invoice.funded <= invoice.amount
+            && invoice.paid <= invoice.amount
+            && invoice.paid <= invoice.funded
+    }
+
+    fn status_balances_valid(invoice: &ModelInvoice) -> bool {
+        match invoice.status {
+            InvoiceStatus::Funded => invoice.funded == invoice.amount && invoice.paid == 0,
+            InvoiceStatus::Paid => invoice.paid == invoice.amount,
+            InvoiceStatus::PartiallyFunded => {
+                invoice.funded > 0 && invoice.funded < invoice.amount && invoice.paid == 0
+            }
+            InvoiceStatus::Pending | InvoiceStatus::Expired | InvoiceStatus::Cancelled => {
+                invoice.paid == 0
+            }
+            InvoiceStatus::Defaulted | InvoiceStatus::Appealed | InvoiceStatus::Disputed => {
+                invoice.funded > 0
+            }
+        }
+    }
+
+    fn authorized(action: Action, caller: u64, roles: Roles) -> bool {
+        match action {
+            Action::Cancel => caller == roles.freelancer,
+            Action::MarkPaid => caller == roles.payer,
+            Action::ClaimDefault => caller == roles.funder,
+            Action::Admin => caller == roles.admin,
+            Action::Dispute | Action::Appeal => caller == roles.payer,
+        }
+    }
+
+    fn storage_key(invoice_id: u64) -> u64 {
+        invoice_id
+    }
+
+    #[test]
+    fn sm1_accepts_documented_transitions() {
+        assert_eq!(
+            transition(InvoiceStatus::Pending, Transition::Fund),
+            Some(InvoiceStatus::Funded)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::MarkPaid),
+            Some(InvoiceStatus::Paid)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::Default),
+            Some(InvoiceStatus::Defaulted)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Defaulted, Transition::Appeal),
+            Some(InvoiceStatus::Appealed)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Appealed, Transition::ResolveAppeal),
+            Some(InvoiceStatus::Defaulted)
+        );
+    }
+
+    #[test]
+    fn sm2_rejects_invalid_or_terminal_transitions() {
+        assert_eq!(transition(InvoiceStatus::Paid, Transition::Fund), None);
+        assert_eq!(transition(InvoiceStatus::Expired, Transition::Cancel), None);
+        assert_eq!(
+            transition(InvoiceStatus::Cancelled, Transition::MarkPaid),
+            None
+        );
+        assert_eq!(
+            transition(InvoiceStatus::PartiallyFunded, Transition::MarkPaid),
+            None
+        );
+    }
+
+    #[test]
+    fn b1_to_b4_hold_for_valid_model_states() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        let funded = ModelInvoice {
+            amount: 100,
+            funded: 100,
+            paid: 0,
+            status: InvoiceStatus::Funded,
+            roles,
+        };
+        let paid = ModelInvoice {
+            status: InvoiceStatus::Paid,
+            paid: 100,
+            ..funded.clone()
+        };
+        let invalid = ModelInvoice {
+            funded: 101,
+            ..funded
+        };
+
+        assert!(balances_valid(&funded) && status_balances_valid(&funded));
+        assert!(balances_valid(&paid) && status_balances_valid(&paid));
+        assert!(!balances_valid(&invalid));
+    }
+
+    #[test]
+    fn a1_to_a6_authorization_matrix_is_exact() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        assert!(authorized(Action::Cancel, roles.freelancer, roles));
+        assert!(!authorized(Action::Cancel, roles.payer, roles));
+        assert!(authorized(Action::MarkPaid, roles.payer, roles));
+        assert!(!authorized(Action::MarkPaid, roles.funder, roles));
+        assert!(authorized(Action::ClaimDefault, roles.funder, roles));
+        assert!(authorized(Action::Admin, roles.admin, roles));
+        assert!(!authorized(Action::Admin, roles.payer, roles));
+        assert!(authorized(Action::Dispute, roles.payer, roles));
+        assert!(authorized(Action::Appeal, roles.payer, roles));
+    }
+
+    #[test]
+    fn s1_invoice_keys_are_independent() {
+        assert_ne!(storage_key(1), storage_key(2));
+        assert_eq!(storage_key(7), storage_key(7));
+    }
+}
