@@ -35,7 +35,11 @@ const chainReader = config.contractId
     })
   : undefined;
 
-const app = createApp(db, { apiKeys: config.apiKeys, chainReader });
+const app = createApp(db, {
+  apiKeys: config.apiKeys,
+  ...(chainReader ? { chainReader } : {}),
+  ...(config.trustProxy !== undefined ? { trustProxy: config.trustProxy } : {}),
+});
 const eventRepository = createSqlEventRepository(db);
 
 // Reorg handling (Issues #863/#864/#866): one header source (Horizon

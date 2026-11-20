@@ -240,7 +240,9 @@ export async function runReconciliation(
           chain = await chainReader.getInvoice(id);
         } catch (error) {
           // Chain read failures are infrastructure noise, not drift — record
-          // and continue; sustained failures surface via alert dispatch below.
+          // and continue. A run with failures is reported inconclusive, never
+          // healthy, so a stale index cannot be reported as OK.
+          report.chainReadFailures += 1;
           report.mismatches.push({
             invoiceId: id,
             field: '__chain_read_error__',
@@ -264,6 +266,7 @@ export async function runReconciliation(
         compareField(report, id, 'amount', row.amount, chain.amount);
         compareField(report, id, 'amount_funded', row.amount_funded, chain.amountFunded);
         compareField(report, id, 'amount_paid', row.amount_paid, chain.amountPaid);
+        compareField(report, id, 'funder', row.funder ?? '', chain.funder ?? '');
       }
     }
 
@@ -271,6 +274,7 @@ export async function runReconciliation(
     try {
       report.chainInvoiceCount = await chainReader.getInvoiceCount();
     } catch {
+      report.chainCountReadFailed = true;
       report.chainInvoiceCount = -1;
     }
 
@@ -298,10 +302,17 @@ export async function runReconciliation(
     // longer exists, so every field comparison below it is suspect.
     report.driftDetected = invoiceDrift || countDrift || report.reorgDivergence !== null;
 
+    report.healthy =
+      !report.driftDetected &&
+      report.error === undefined &&
+      report.chainReadFailures === 0 &&
+      !report.chainCountReadFailed;
+
     return report;
   } catch (error) {
     report.error = error instanceof Error ? error.message : String(error);
     report.driftDetected = true;
+    report.healthy = false;
     return report;
   }
 }
@@ -462,15 +473,32 @@ export function startReconciliationSchedule(
           console.error(JSON.stringify(payload, null, 2));
           return Promise.resolve();
         });
-        await alert(buildAlertPayload(report));
+        try {
+          await alert(buildAlertPayload(report));
+        } catch (error) {
+          // A failing notifier must not stop future reconciliation ticks.
+          logger.error(
+            `Reconciliation alert delivery failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
       } else if (report.error) {
         logger.warn(`Reconciliation run errored: ${report.error}`);
+      } else if (!report.healthy) {
+        logger.warn(
+          `Reconciliation inconclusive: ${report.chainReadFailures} chain read failure(s), chain count ${
+            report.chainCountReadFailed ? 'unavailable' : 'available'
+          }. Index health cannot be confirmed.`
+        );
       } else {
         logger.info(
           `Reconciliation OK: ${report.sampledInvoices} invoices sampled, ` +
             `${report.reorgHeadersChecked} ledger header(s) verified, no drift beyond ${(config.tolerancePercent).toFixed(2)}%.`
         );
       }
+    } catch (error) {
+      logger.error(
+        `Reconciliation tick failed: ${error instanceof Error ? error.message : String(error)}`
+      );
     } finally {
       running = false;
     }

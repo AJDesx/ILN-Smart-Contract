@@ -23,6 +23,12 @@ export const config = {
   graphqlMaxComplexity: parseInt(process.env.GRAPHQL_MAX_COMPLEXITY || '200', 10),
   /** Ledger lag above this marks health as degraded. */
   healthMaxLagLedgers: parseInt(process.env.HEALTH_MAX_LAG_LEDGERS || '50', 10),
+  /**
+   * Express `trust proxy` setting. Leave unset when the indexer is directly
+   * exposed; set it only when a trusted reverse proxy strips client-supplied
+   * forwarding headers. Accepts `true`/`false`, a hop count, or a subnet list.
+   */
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
 };
 
 function parseCsv(value: string | undefined): string[] {
@@ -30,6 +36,26 @@ function parseCsv(value: string | undefined): string[] {
     .split(',')
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
+}
+
+function parseTrustProxy(
+  value: string | undefined
+): boolean | number | string | undefined {
+  if (value === undefined || value.trim() === '') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (['1', 'true', 'yes', 'on'].includes(normalized.toLowerCase())) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized.toLowerCase())) {
+    return false;
+  }
+  const hopCount = Number(normalized);
+  if (Number.isSafeInteger(hopCount) && hopCount > 0) {
+    return hopCount;
+  }
+  return normalized;
 }
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
