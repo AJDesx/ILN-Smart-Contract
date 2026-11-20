@@ -60,6 +60,26 @@ function makeRaw(
 // ---------------------------------------------------------------------------
 
 describe("parseContractEvent", () => {
+  it("ignores fields added by a future contract version", () => {
+    const raw = makeRaw("partially_paid", [4n, "GPAYER"], {
+      amount_paid_now: "2",
+      total_amount_paid: "5",
+      remaining_amount: "8",
+      future_field: { version: 2 },
+    });
+    expect(parseContractEvent(raw)).toMatchObject({
+      type: "partially_paid",
+      invoiceId: 4n,
+      remainingAmount: 8n,
+    });
+    expect(parseContractEvent(raw)).not.toHaveProperty("future_field");
+  });
+
+  it("ignores an event whose decoded payload is not a field map", () => {
+    const raw = makeRaw("partially_paid", [4n, "GPAYER"], {});
+    expect(parseContractEvent({ ...raw, value: "malformed" })).toBeNull();
+  });
+
   it("parses submitted", () => {
     const raw = makeRaw("submitted", [1n, "GFREELANCER", "GPAYER"], {
       token: "CDTOKEN",

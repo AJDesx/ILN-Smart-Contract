@@ -50,6 +50,8 @@ interface HorizonContractEvent {
 
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 
+const invalidScVal = Symbol("invalid ScVal");
+
 /**
  * Decode a base-64 XDR ScVal and convert it to a plain JS value via
  * `scValToNative` from the Stellar SDK.
@@ -59,7 +61,7 @@ function decodeScVal(base64Xdr: string): unknown {
     const scVal = xdr.ScVal.fromXDR(base64Xdr, "base64");
     return scValToNative(scVal);
   } catch {
-    return null;
+    return invalidScVal;
   }
 }
 
@@ -101,7 +103,9 @@ function parseContractEventInternal(
   // Decode the topics (beyond the first which is the type) and the value
   const topics = (raw.topic || []).slice(1).map(decodeScVal);
   const value = decodeScVal(raw.value || "");
-  const body = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  if (topics.includes(invalidScVal) || value === invalidScVal) return null;
+  if (value != null && (typeof value !== "object" || Array.isArray(value))) return null;
+  const body = (value ?? {}) as Record<string, unknown>;
 
   const big = (v: unknown): bigint => {
     try { return BigInt(String(v)); } catch { return 0n; }
