@@ -90,7 +90,7 @@ export function makePayCommand(
   cmd
     .description("Pay an invoice in full or partially")
     .requiredOption("--id <invoiceId>", "Invoice ID to pay")
-    .option("--amount <usdc>", "Amount to pay (omit for full payment)", parseFloat)
+    .option("--amount <usdc>", "Amount to pay (omit for full payment)", Number)
     .option("--yes", "Skip confirmation prompt", false)
     .action(async (opts: { id: string; amount?: number; yes: boolean }) => {
       const options: PayOptions = {
@@ -116,12 +116,12 @@ export function makePayCommand(
           ? options.amount
           : invoice.remainingAmount; // full payment
 
-      if (payAmount <= 0) {
-        console.error("Payment amount must be greater than 0.");
+      if (!Number.isFinite(payAmount) || payAmount <= 0) {
+        console.error("Payment amount must be a finite number greater than 0.");
         process.exit(1);
       }
 
-      if (payAmount > invoice.remainingAmount) {
+      if (!Number.isFinite(invoice.remainingAmount) || payAmount > invoice.remainingAmount) {
         console.error(
           `Amount ${payAmount} exceeds remaining balance of ${invoice.remainingAmount} ${invoice.token}.`,
         );
@@ -148,8 +148,9 @@ export function makePayCommand(
         result = await executor(options.id, payAmount);
       } catch (err) {
         console.error(
-          `Payment failed: ${err instanceof Error ? err.message : String(err)}`,
+          `Payment could not be confirmed: ${err instanceof Error ? err.message : String(err)}`,
         );
+        console.error("Check the transaction or current invoice state before retrying.");
         process.exit(1);
       }
 

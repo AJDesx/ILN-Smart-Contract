@@ -1,4 +1,4 @@
-import { vi, describe, it, expect } from 'vitest';
+import { afterEach, vi, describe, it, expect } from 'vitest';
 /**
  * Tests for `iln pay` — full and partial payment flows.
  * Issue: #232
@@ -11,6 +11,8 @@ import type { InvoicePayState, PayResult } from "../../src/commands/pay-types";
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const INVOICE_ID = "INV-100";
+
+afterEach(() => vi.restoreAllMocks());
 
 function mockInvoice(overrides: Partial<InvoicePayState> = {}): InvoicePayState {
   return {
@@ -135,6 +137,42 @@ describe("iln pay — partial payment", () => {
     expect(errors.some((e) => e.includes("exceeds remaining balance"))).toBe(true);
     expect(executor).not.toHaveBeenCalled();
     exitSpy.mockRestore();
+  });
+
+  it.each(["NaN", "Infinity", "50USDC"])("rejects invalid amount %s before confirmation", async (amount) => {
+    const fetcher = vi.fn().mockResolvedValue(mockInvoice());
+    const executor = vi.fn();
+    const prompter = makePromptYes();
+    const cmd = makePayCommand(prompter, fetcher, executor);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("exit"); });
+
+    try {
+      await expect(cmd.parseAsync(["node", "iln", "--id", INVOICE_ID, "--amount", amount])).rejects.toThrow("exit");
+      expect(prompter).not.toHaveBeenCalled();
+      expect(executor).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("does not retry or print a receipt after an unconfirmed submission", async () => {
+    const fetcher = vi.fn().mockResolvedValue(mockInvoice());
+    const executor = vi.fn().mockRejectedValue(new Error("RPC timed out"));
+    const cmd = makePayCommand(makePromptYes(), fetcher, executor);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("exit"); });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await expect(cmd.parseAsync(["node", "iln", "--id", INVOICE_ID, "--yes"])).rejects.toThrow("exit");
+      expect(executor).toHaveBeenCalledTimes(1);
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("before retrying"));
+      expect(logs).not.toHaveBeenCalledWith(expect.stringContaining("Settlement Receipt"));
+    } finally {
+      exitSpy.mockRestore();
+      errors.mockRestore();
+      logs.mockRestore();
+    }
   });
 });
 
