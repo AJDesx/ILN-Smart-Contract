@@ -30,8 +30,15 @@ To regenerate: `cd sdk && git-cliff --config .cliff.toml`
   `approve` (contract rejections surface as typed `ILNError`s without costing an approve fee), and treats
   `TRY_AGAIN_LATER` as a failure instead of returning a hash. `getAllowance` accepts an optional
   `networkPassphrase` (it was hard-coded to testnet); `getTokenBalance` is new.
+- `ILNClient.submitBatchTransaction` now refuses, before the network check or any signing, to include a call
+  whose `contractId` is not one of the client's configured contracts (`contractId`, `contracts`, or the new
+  `additionalContractIds` option) and throws a `ValidationError` naming the call. It also refuses to sign when
+  the signer declares a network passphrase (e.g. `FreighterSigner`) different from the client's. The RPC
+  passphrase check (`verifyNetwork`) already failed closed; its doc wrongly said the factories ran it.
 
 ### Changed
+- **Behavior change:** batches that target contracts outside the client's configuration (typically a token
+  contract bundled with `fund_invoice`) must now list them in `additionalContractIds`.
 - Client-side-only errors `InvalidAddress`, `InvalidTransfer` and `InvoiceNotCancellable` no longer carry
   codes 37/38/39 (`code` is `undefined`), so they cannot be confused with on-chain codes.
   `fromError` no longer maps `Error(Contract, 999)` to `InsufficientAmount` (the contract never emits 999).
