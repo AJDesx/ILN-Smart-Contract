@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, IntoVal,
 };
 
 struct Setup {
@@ -1511,4 +1511,205 @@ fn pair_collusion_heuristic_flags_concentration_then_relaxes() {
     assert_eq!(s.client.get_pair_default_count(&s.lp, &payer_b), 7);
     assert_eq!(s.client.get_default_count(&s.lp), 10);
     assert!(!s.client.get_pair_collusion_flag(&s.lp, &payer_a));
+}
+
+// ── Issue #1194: enrollment / premium / claim authorization ───────────
+//
+// Unlike `setup()`, these tests deliberately do NOT call `mock_all_auths()`,
+// so each entrypoint's `require_auth()` is evaluated for real. A test mocks
+// exactly one caller's authorization and asserts that a different caller is
+// rejected (or, for the positive path, that the required signer is accepted).
+
+struct NoMockSetup {
+    env: Env,
+    client: InsurancePoolClient<'static>,
+    admin: Address,
+    lp: Address,
+}
+
+/// Registers and initializes a pool with real auth enforcement. Only the
+/// admin's `initialize` authorization is mocked, so the pool can be brought
+/// up without enabling `mock_all_auths()` for the whole test.
+fn setup_no_mock_auths() -> NoMockSetup {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InsurancePool);
+    let client = InsurancePoolClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let lp = Address::generate(&env);
+
+    let token_admin_addr = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin_addr)
+        .address();
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (admin.clone(), COVERAGE, token_address.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin, &COVERAGE, &token_address);
+
+    NoMockSetup {
+        env,
+        client,
+        admin,
+        lp,
+    }
+}
+
+#[test]
+fn enroll_requires_lp_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    // Only the impostor authorizes the call; the LP's signature is absent.
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "enroll",
+            args: (s.lp.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_enroll(&s.lp).is_err());
+    // The rejected call left no enrollment state behind.
+    assert!(!s.client.is_enrolled(&s.lp));
+}
+
+#[test]
+fn enroll_succeeds_with_lp_authorization() {
+    let s = setup_no_mock_auths();
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.lp,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "enroll",
+            args: (s.lp.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.enroll(&s.lp);
+    assert!(s.client.is_enrolled(&s.lp));
+}
+
+#[test]
+fn enroll_is_idempotent_and_does_not_inflate_enrolled_count() {
+    let s = setup();
+
+    assert_eq!(s.client.get_pool_health().enrolled_lp_count, 0);
+    s.client.enroll(&s.lp);
+    s.client.enroll(&s.lp); // repeated enroll is a no-op
+    assert_eq!(s.client.get_pool_health().enrolled_lp_count, 1);
+}
+
+#[test]
+fn deposit_premium_requires_lp_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    // `deposit_premium` gates on `lp.require_auth()` before touching any
+    // state or the token, so no funded balance is needed to exercise it.
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "deposit_premium",
+            args: (s.lp.clone(), 250i128).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_deposit_premium(&s.lp, &250).is_err());
+    // No accounting movement happened.
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_premiums_paid(&s.lp), 0);
+}
+
+#[test]
+fn claim_requires_admin_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (1u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_claim(&1, &s.lp).is_err());
+    // An unauthorized claim records no payout.
+    assert!(!s.client.is_claimed(&1));
+}
+
+#[test]
+fn enrolled_lp_cannot_claim_for_itself() {
+    let s = setup_no_mock_auths();
+
+    // The LP authorizes the call, but `claim` requires the *admin*'s auth; an
+    // LP's own signature does not satisfy it.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.lp,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (5u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_claim(&5, &s.lp).is_err());
+    assert!(!s.client.is_claimed(&5));
+}
+
+#[test]
+fn admin_authorized_claim_passes_gate_and_empty_pool_is_rejected() {
+    let s = setup_no_mock_auths();
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (2u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // With the admin's authorization present the call clears `require_admin`
+    // and is rejected only because the pool holds no reserve.
+    assert_eq!(
+        s.client.try_claim(&2, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::PoolEmpty)))
+    );
+}
+
+#[test]
+fn repeated_claim_moves_no_tokens() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &(COVERAGE * 2));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 2));
+
+    let first_payout = s.client.claim(&42, &s.lp);
+    assert!(first_payout > 0);
+    let lp_after_first = s.token_client.balance(&s.lp);
+    let pool_after_first = s.client.get_pool_balance();
+
+    // A second claim for the same invoice is rejected by the per-invoice
+    // idempotency key and moves no additional tokens.
+    assert!(s.client.try_claim(&42, &s.lp).is_err());
+    assert_eq!(s.token_client.balance(&s.lp), lp_after_first);
+    assert_eq!(s.client.get_pool_balance(), pool_after_first);
 }
