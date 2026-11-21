@@ -9,8 +9,10 @@ import { config } from './config.js';
 import { createApiKeyMiddleware } from './middleware/apiKey.js';
 import { createRateLimitMiddleware } from './middleware/rateLimit.js';
 import { createEventsRouter } from './api/routes/events.js';
+import { createMonitoringRouter } from './api/routes/monitoring.js';
 import { createHealthRouter, type HealthCheckDeps } from './api/routes/health.js';
 import { createProtocolStatusRouter } from './api/routes/protocolStatus.js';
+import { createPublicHealthRouter } from './api/routes/publicHealth.js';
 import {
   createProtocolStatusService,
   type ProtocolStatusService,
@@ -37,6 +39,12 @@ export interface CreateAppOptions {
   chainReader?: Pick<ChainReader, 'getProtocolStatus'>;
   /** Pre-built protocol-status service (overrides `chainReader`); for tests. */
   protocolStatusService?: ProtocolStatusService;
+  /**
+   * Express `trust proxy` setting. Defaults to unset (do not trust forwarding
+   * headers) so clients cannot spoof `X-Forwarded-For` and reset rate limits.
+   * Set only when a trusted reverse proxy strips client-supplied headers.
+   */
+  trustProxy?: boolean | number | string;
 }
 
 export function createApp(
@@ -44,6 +52,9 @@ export function createApp(
   options: CreateAppOptions = {}
 ): express.Express {
   const app = express();
+  if (options.trustProxy !== undefined) {
+    app.set('trust proxy', options.trustProxy);
+  }
   const apiKeys = options.apiKeys ?? config.apiKeys;
   const rateLimitWindowMs = options.rateLimitWindowMs ?? config.rateLimitWindowMs;
   const rateLimitAnonymousMax =
@@ -95,6 +106,8 @@ export function createApp(
     options.protocolStatusService ??
     createProtocolStatusService({ reader: options.chainReader });
   app.use(createProtocolStatusRouter(protocolStatusService));
+  // Curated public summary feeding the static status page (Issue #892).
+  app.use(createPublicHealthRouter(db, protocolStatusService));
 
   app.use(createLeaderboardRouter(db));
   app.use(createReputationRouter(db));
@@ -102,6 +115,7 @@ export function createApp(
   app.use(createInvoicesRouter(db));
   app.use(createInsuranceRouter(db));
   app.use(createEventsRouter(db));
+  app.use('/monitoring', createMonitoringRouter(db));
   mountGraphQL(app, db, {
     maxDepth: options.graphqlMaxDepth ?? config.graphqlMaxDepth,
     maxComplexity: options.graphqlMaxComplexity ?? config.graphqlMaxComplexity,

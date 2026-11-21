@@ -80,6 +80,7 @@ docker compose down
 - `RATE_LIMIT_ANON_MAX` - Anonymous requests per window (default `60`)
 - `RATE_LIMIT_API_KEY_MAX` - API-key requests per window (default `600`)
 - `RATE_LIMIT_WINDOW_MS` - Rate-limit window in ms (default `60000`)
+- `TRUST_PROXY` - Express `trust proxy` value (e.g. `1`, `true`, or a subnet list). Leave unset when directly exposed so `X-Forwarded-For` cannot spoof rate-limit identity.
 - `GRAPHQL_MAX_DEPTH` / `GRAPHQL_MAX_COMPLEXITY` - GraphQL abuse limits (defaults `8` / `200`)
 - `INGESTION_ENABLED` - Set `false` on read-only API replicas (default `true`)
 - `HEALTH_MAX_LAG_LEDGERS` - Lag threshold for degraded health (default `50`)

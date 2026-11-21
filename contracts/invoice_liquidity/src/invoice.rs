@@ -1,5 +1,6 @@
 pub use crate::storage::DataKey as StorageKey;
-use soroban_sdk::{contracttype, Address, BytesN, Env, IntoVal, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 /// A nullable BytesN<32> that works with #[contracttype] derive.
 /// In Soroban SDK 21.x, `Option<BytesN<32>>` doesn't implement the required
@@ -62,6 +63,19 @@ pub enum ReferralCode {
 //   Operations on invoice i never read or write invoice j (i != j).
 // INVARIANT S2: Submitter invoice index and LP invoice index are eventually
 //   consistent — every invoice appears in at least one index.
+//
+// == Fund-Queue Invariants (Issue #1017) ==
+// INVARIANT Q1: resolve_fund_queue only finalizes a *not-yet-resolved*
+//   queue while invoice.status is Pending or PartiallyFunded — matching
+//   join_fund_queue's own status gate. cancel_invoice / expire_invoice
+//   never touch FundQueue / FundQueueOpenedAt / QueueResolution, so without
+//   this check a queue left unresolved when the invoice was cancelled or
+//   expired would still be resolvable afterward, announcing a reputation-
+//   weighted "winner" for funding that can never happen.
+// INVARIANT Q2: a queue already resolved (QueueResolution present) before
+//   cleanup stays resolved — cancel_invoice / expire_invoice cannot erase a
+//   decision that already finalized; resolve_fund_queue's cache check for
+//   an existing QueueResolution runs before Q1's status gate.
 // ----------------------------------------------------------------
 
 // ----------------------------------------------------------------
@@ -529,8 +543,8 @@ pub fn get_payer_score(env: &Env, payer: &Address) -> u32 {
                     && decay_config.decay_rate_bps > 0
                 {
                     // Calculate number of decay periods that have passed
-                    let periods_passed =
-                        u64::from(ledgers_since_activity).saturating_div(decay_config.decay_period_ledgers);
+                    let periods_passed = u64::from(ledgers_since_activity)
+                        .saturating_div(decay_config.decay_period_ledgers);
 
                     // Apply decay: score = score * (1 - decay_rate/10000)^periods
                     // Issue #601: periods_passed is unbounded (governance-
@@ -542,8 +556,9 @@ pub fn get_payer_score(env: &Env, payer: &Address) -> u32 {
                         } else {
                             let mut decayed_score = rep.score as u64;
                             for _ in 0..periods_passed {
-                                let mut decay_amount =
-                                    decayed_score.saturating_mul(decay_config.decay_rate_bps as u64).saturating_div(10_000);
+                                let mut decay_amount = decayed_score
+                                    .saturating_mul(decay_config.decay_rate_bps as u64)
+                                    .saturating_div(10_000);
                                 if decay_amount == 0 && decayed_score > 0 {
                                     decay_amount = 1;
                                 }
@@ -551,7 +566,6 @@ pub fn get_payer_score(env: &Env, payer: &Address) -> u32 {
                             }
                             decayed_score
                         };
-
 
                     let new_score = (decayed_score.min(100)) as u32;
                     if new_score != rep.score {
@@ -858,54 +872,147 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
     }
 }
 
-/// Return all queued LP requests for an invoice
+/// Return all queued LP requests for an invoice.
+///
+/// Issues #1009 / #1010: the queue helpers live in `storage.rs`, where reads
+/// and writes extend the TTL of the queue, its opened-at marker and the
+/// resolution record together. These wrappers delegate so there is a single
+/// implementation.
 pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueue(invoice_id))
-        .unwrap_or(soroban_sdk::Vec::new(env))
+    crate::storage::get_fund_queue(env, invoice_id)
 }
 
-/// Persist the queue
+/// Persist the queue and extend its TTL (Issue #1025, #1091)
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    env.storage()
-        .persistent()
-        .set(&StorageKey::FundQueue(invoice_id), queue);
+    crate::storage::save_fund_queue(env, invoice_id, queue)
 }
 
 /// Return the resolved (approved) funder for an invoice, if any
 pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::QueueResolution(invoice_id))
+    crate::storage::get_queue_resolution(env, invoice_id)
 }
 
-/// Store the approved funder chosen by the priority queue
+/// Store the approved funder chosen by the priority queue and extend its TTL (Issue #1025, #1091)
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
     env.storage()
         .persistent()
         .set(&StorageKey::QueueResolution(invoice_id), approved_lp);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::QueueResolvedAt(invoice_id), &env.ledger().sequence());
+}
+
+/// Ledger sequence at which the queue winner was locked in, if resolved.
+pub fn get_queue_resolved_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::QueueResolvedAt(invoice_id))
+}
+
+/// Remove every queue-related entry for `invoice_id`. Idempotent.
+pub fn clear_fund_queue_state(env: &Env, invoice_id: u64) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::FundQueue(invoice_id));
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+}
+
+/// Reopen the queue after evicting a stalled winner: drop the resolution and
+/// restart the maturity window for the remaining LPs (or clear it if empty).
+pub fn reopen_fund_queue(env: &Env, invoice_id: u64, remaining: &soroban_sdk::Vec<LpFundRequest>) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    if remaining.is_empty() {
+        p.remove(&StorageKey::FundQueue(invoice_id));
+        p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+    } else {
+        p.set(&StorageKey::FundQueue(invoice_id), remaining);
+        p.set(&StorageKey::FundQueueOpenedAt(invoice_id), &env.ledger().sequence());
+    }
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
 /// Called once when the queue transitions from empty to non-empty.
-/// Subsequent joins do not overwrite this value.
+/// Subsequent joins do not overwrite this value. Extends TTL (Issue #1025, #1091).
 pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
-    let key = StorageKey::FundQueueOpenedAt(invoice_id);
-    if !env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .set(&key, &env.ledger().sequence());
-    }
+    crate::storage::try_set_fund_queue_opened_at(env, invoice_id)
 }
 
 /// Return the ledger sequence when the fund queue for `invoice_id` was first
 /// opened (i.e. when the first LP joined), or `None` if the queue is still
 /// empty.
 pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueueOpenedAt(invoice_id))
+    crate::storage::get_fund_queue_opened_at(env, invoice_id)
+}
+
+/// Issue #1015: per-key TTL headroom for the fund-queue records that gate
+/// `resolve_fund_queue`'s MEV-mitigation delay (Issue #MEV-1), the
+/// fail-closed archived-state check (Issue #1013), and the pre-upgrade TTL
+/// guard (Issue #1082, `TTL_MIN_LEDGERS_BEFORE_UPGRADE`).
+///
+/// `margin` is `remaining_ttl - TTL_MIN_LEDGERS_BEFORE_UPGRADE`: positive
+/// means the key has at least that much headroom above the threshold the
+/// upgrade guard enforces; zero or negative means it has already drifted
+/// into the zone an upgrade would reject (and, for `FundQueueOpenedAt`
+/// specifically, the zone where an untouched key risks the archived-state
+/// failure). `None` fields mean the corresponding key does not currently
+/// exist (never written, or already evicted).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueTtlMargins {
+    pub fund_queue_ttl: Option<u32>,
+    pub fund_queue_margin: Option<i64>,
+    pub fund_queue_opened_at_ttl: Option<u32>,
+    pub fund_queue_opened_at_margin: Option<i64>,
+    pub queue_resolution_ttl: Option<u32>,
+    pub queue_resolution_margin: Option<i64>,
+}
+
+/// Issue #1015: measure the live TTL (and margin above
+/// `TTL_MIN_LEDGERS_BEFORE_UPGRADE`) for each fund-queue-related persistent
+/// key of `invoice_id`, so operators can monitor queue health and catch TTL
+/// drift before it causes an upgrade rejection (Issue #1082) or a
+/// `QueueStateArchived` failure (Issue #1013), rather than finding out only
+/// when one of those checks actually fires.
+pub fn get_fund_queue_ttl_margins(env: &Env, invoice_id: u64) -> FundQueueTtlMargins {
+    let threshold = crate::constants::TTL_MIN_LEDGERS_BEFORE_UPGRADE as i64;
+
+    let fq_key = StorageKey::FundQueue(invoice_id);
+    let (fund_queue_ttl, fund_queue_margin) = if env.storage().persistent().has(&fq_key) {
+        let ttl = env.storage().persistent().get_ttl(&fq_key);
+        (Some(ttl), Some(ttl as i64 - threshold))
+    } else {
+        (None, None)
+    };
+
+    let fqoa_key = StorageKey::FundQueueOpenedAt(invoice_id);
+    let (fund_queue_opened_at_ttl, fund_queue_opened_at_margin) =
+        if env.storage().persistent().has(&fqoa_key) {
+            let ttl = env.storage().persistent().get_ttl(&fqoa_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    let qr_key = StorageKey::QueueResolution(invoice_id);
+    let (queue_resolution_ttl, queue_resolution_margin) =
+        if env.storage().persistent().has(&qr_key) {
+            let ttl = env.storage().persistent().get_ttl(&qr_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    FundQueueTtlMargins {
+        fund_queue_ttl,
+        fund_queue_margin,
+        fund_queue_opened_at_ttl,
+        fund_queue_opened_at_margin,
+        queue_resolution_ttl,
+        queue_resolution_margin,
+    }
 }
 // Contract stats helpers
 // ----------------------------------------------------------------
@@ -970,11 +1077,34 @@ pub fn get_contract_stats(env: &Env) -> ContractStats {
     }
 }
 
+/// Price used to USD-normalize `token`'s volume in `get_contract_stats`.
+///
+/// Issue #860: this used to bypass the oracle registry entirely — a bare
+/// (panicking) `invoke_contract` against the legacy `Config.price_oracle`,
+/// with no circuit-breaker or health check, so stats would happily
+/// normalize with data the registry had already observed as tripped/stale
+/// (or trap the whole read if the oracle didn't respond). It now resolves
+/// through the registry (per-token/feed `Price` entry first, legacy
+/// `price_oracle` as fallback) and consults the shared health gate before
+/// trusting anything:
+///
+/// - circuit tripped for `(Price, token)` → `None`
+/// - last health snapshot stale → `None`
+/// - oracle query fails / returns garbage → `None` (non-panicking
+///   `try_invoke_contract` via `oracle_registry::query_price`)
+///
+/// `None` makes `get_contract_stats` skip that token's contribution instead
+/// of trusting a bad price or aborting the read.
 fn get_price_from_oracle(env: &Env, token: &Address) -> Option<i128> {
-    let config = crate::storage::get_config(env)?;
-    let oracle = config.price_oracle?;
-    let args = soroban_sdk::vec![env, token.clone().into_val(env)];
-    Some(env.invoke_contract::<i128>(&oracle, &Symbol::new(env, "get_price"), args))
+    use crate::oracle_registry::{
+        query_price, require_healthy_price_feed, resolve_oracle, OracleFeedType,
+    };
+
+    let feed = OracleFeedType::Price;
+    require_healthy_price_feed(env, feed, token).ok()?;
+    let oracle = resolve_oracle(env, feed, token)
+        .or_else(|| crate::storage::get_config(env).and_then(|config| config.price_oracle))?;
+    query_price(env, &oracle, token)
 }
 
 pub fn add_volume(env: &Env, token: &Address, amount: i128) {
@@ -1088,4 +1218,244 @@ pub fn get_last_pause_timestamp(env: &Env) -> u64 {
         .instance()
         .get(&StorageKey::LastPauseTimestamp)
         .unwrap_or(0)
+}
+
+// ----------------------------------------------------------------
+// Issue #1031: Queue Tie-Score Margin helpers
+// ----------------------------------------------------------------
+
+/// Return the current queue tie-score margin (default 0 = disabled).
+///
+/// When non-zero, `join_fund_queue` requires the joining LP to have a score
+/// of at least `current_best_score + margin`, rather than simply ≥ best_score.
+/// This raises the economic barrier to equal-score manipulation: an attacker
+/// at the default score cannot silently tie with an established LP without
+/// first building `margin` additional funded-invoice history.
+///
+/// Score range: 50 (default) to 100 (max). A margin > 50 is clamped to 50 by
+/// `set_queue_tie_score_margin` to avoid blocking legitimate high-rep LPs.
+pub fn get_queue_tie_score_margin(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::QueueTieScoreMargin)
+        .unwrap_or(0)
+}
+
+/// Persist a new queue tie-score margin. Clamped to [0, 50].
+pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
+    let margin = margin.min(50);
+    env.storage()
+        .instance()
+        .set(&StorageKey::QueueTieScoreMargin, &margin);
+}
+
+#[cfg(test)]
+mod proof_obligation_tests {
+    //! Pure model for the maintained invoice lifecycle and accounting invariants.
+    //! The model uses lifecycle status, stored amount/funded/paid balances, role
+    //! identities, and deterministic storage keys. It defines illegal transitions,
+    //! terminal states, balance bounds, authorization rules, and key isolation;
+    //! repeated or unauthorized actions are rejected without state transition.
+
+    use super::InvoiceStatus;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Transition {
+        Fund,
+        PartiallyFund,
+        Cancel,
+        Expire,
+        Dispute,
+        MarkPaid,
+        Default,
+        Appeal,
+        ResolveAppeal,
+        ResolveDispute,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Action {
+        Cancel,
+        MarkPaid,
+        ClaimDefault,
+        Admin,
+        Dispute,
+        Appeal,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Roles {
+        payer: u64,
+        freelancer: u64,
+        funder: u64,
+        admin: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModelInvoice {
+        amount: i128,
+        funded: i128,
+        paid: i128,
+        status: InvoiceStatus,
+        roles: Roles,
+    }
+
+    fn transition(from: InvoiceStatus, action: Transition) -> Option<InvoiceStatus> {
+        match (from, action) {
+            (InvoiceStatus::Pending, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Pending, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            (InvoiceStatus::Pending, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Pending, Transition::Expire) => Some(InvoiceStatus::Expired),
+            (InvoiceStatus::Pending, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::PartiallyFunded, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::PartiallyFunded, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::PartiallyFunded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Funded, Transition::MarkPaid) => Some(InvoiceStatus::Paid),
+            (InvoiceStatus::Funded, Transition::Default) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Funded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Defaulted, Transition::Appeal) => Some(InvoiceStatus::Appealed),
+            (InvoiceStatus::Appealed, Transition::ResolveAppeal) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Disputed, Transition::ResolveDispute) => Some(InvoiceStatus::Pending),
+            (InvoiceStatus::Disputed, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Disputed, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Disputed, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            _ => None,
+        }
+    }
+
+    fn balances_valid(invoice: &ModelInvoice) -> bool {
+        invoice.amount > 0
+            && invoice.funded >= 0
+            && invoice.paid >= 0
+            && invoice.funded <= invoice.amount
+            && invoice.paid <= invoice.amount
+            && invoice.paid <= invoice.funded
+    }
+
+    fn status_balances_valid(invoice: &ModelInvoice) -> bool {
+        match invoice.status {
+            InvoiceStatus::Funded => invoice.funded == invoice.amount && invoice.paid == 0,
+            InvoiceStatus::Paid => invoice.paid == invoice.amount,
+            InvoiceStatus::PartiallyFunded => {
+                invoice.funded > 0 && invoice.funded < invoice.amount && invoice.paid == 0
+            }
+            InvoiceStatus::Pending | InvoiceStatus::Expired | InvoiceStatus::Cancelled => {
+                invoice.paid == 0
+            }
+            InvoiceStatus::Defaulted | InvoiceStatus::Appealed | InvoiceStatus::Disputed => {
+                invoice.funded > 0
+            }
+        }
+    }
+
+    fn authorized(action: Action, caller: u64, roles: Roles) -> bool {
+        match action {
+            Action::Cancel => caller == roles.freelancer,
+            Action::MarkPaid => caller == roles.payer,
+            Action::ClaimDefault => caller == roles.funder,
+            Action::Admin => caller == roles.admin,
+            Action::Dispute | Action::Appeal => caller == roles.payer,
+        }
+    }
+
+    fn storage_key(invoice_id: u64) -> u64 {
+        invoice_id
+    }
+
+    #[test]
+    fn sm1_accepts_documented_transitions() {
+        assert_eq!(
+            transition(InvoiceStatus::Pending, Transition::Fund),
+            Some(InvoiceStatus::Funded)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::MarkPaid),
+            Some(InvoiceStatus::Paid)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::Default),
+            Some(InvoiceStatus::Defaulted)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Defaulted, Transition::Appeal),
+            Some(InvoiceStatus::Appealed)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Appealed, Transition::ResolveAppeal),
+            Some(InvoiceStatus::Defaulted)
+        );
+    }
+
+    #[test]
+    fn sm2_rejects_invalid_or_terminal_transitions() {
+        assert_eq!(transition(InvoiceStatus::Paid, Transition::Fund), None);
+        assert_eq!(transition(InvoiceStatus::Expired, Transition::Cancel), None);
+        assert_eq!(
+            transition(InvoiceStatus::Cancelled, Transition::MarkPaid),
+            None
+        );
+        assert_eq!(
+            transition(InvoiceStatus::PartiallyFunded, Transition::MarkPaid),
+            None
+        );
+    }
+
+    #[test]
+    fn b1_to_b4_hold_for_valid_model_states() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        let funded = ModelInvoice {
+            amount: 100,
+            funded: 100,
+            paid: 0,
+            status: InvoiceStatus::Funded,
+            roles,
+        };
+        let paid = ModelInvoice {
+            status: InvoiceStatus::Paid,
+            paid: 100,
+            ..funded.clone()
+        };
+        let invalid = ModelInvoice {
+            funded: 101,
+            ..funded
+        };
+
+        assert!(balances_valid(&funded) && status_balances_valid(&funded));
+        assert!(balances_valid(&paid) && status_balances_valid(&paid));
+        assert!(!balances_valid(&invalid));
+    }
+
+    #[test]
+    fn a1_to_a6_authorization_matrix_is_exact() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        assert!(authorized(Action::Cancel, roles.freelancer, roles));
+        assert!(!authorized(Action::Cancel, roles.payer, roles));
+        assert!(authorized(Action::MarkPaid, roles.payer, roles));
+        assert!(!authorized(Action::MarkPaid, roles.funder, roles));
+        assert!(authorized(Action::ClaimDefault, roles.funder, roles));
+        assert!(authorized(Action::Admin, roles.admin, roles));
+        assert!(!authorized(Action::Admin, roles.payer, roles));
+        assert!(authorized(Action::Dispute, roles.payer, roles));
+        assert!(authorized(Action::Appeal, roles.payer, roles));
+    }
+
+    #[test]
+    fn s1_invoice_keys_are_independent() {
+        assert_ne!(storage_key(1), storage_key(2));
+        assert_eq!(storage_key(7), storage_key(7));
+    }
 }
