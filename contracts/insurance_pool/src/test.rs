@@ -1713,3 +1713,171 @@ fn repeated_claim_moves_no_tokens() {
     assert_eq!(s.token_client.balance(&s.lp), lp_after_first);
     assert_eq!(s.client.get_pool_balance(), pool_after_first);
 }
+
+// ── Issue #1195: claim accounting conservation ────────────────────────
+//
+// These tests pin the *conservation* properties of `claim`: a payout can
+// never exceed the LP's allocated (tiered) coverage nor the pool's total
+// reserve (`Balance + BackstopBalance`), and a rejected payout leaves every
+// pool counter untouched. Assumptions, data sources, and the verified /
+// residual split are recorded in docs/insurance-pool-claim-accounting.md.
+
+/// Total reserve available to pay claims: liquid balance plus backstop.
+fn total_reserve(s: &Setup) -> i128 {
+    s.client.get_pool_balance() + s.client.get_backstop_balance()
+}
+
+#[test]
+fn claim_payout_is_capped_by_tiered_coverage_when_pool_is_larger() {
+    let s = setup();
+
+    // 10x the coverage cap funded -> tier-4 coverage = 150% of the cap, far
+    // below the pool reserve.
+    s.token_admin.mint(&s.lp, &(COVERAGE * 10));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 10));
+
+    let tiered = s.client.get_tiered_coverage(&s.lp);
+    assert_eq!(tiered, (COVERAGE * 150) / 100);
+
+    let reserve_before = total_reserve(&s);
+
+    let payout = s.client.claim(&1, &s.lp);
+
+    // Allocated coverage, not the larger reserve, bounds the payout.
+    assert_eq!(payout, tiered);
+    assert!(payout < reserve_before);
+    // Value conservation: the reserve drops by exactly the payout.
+    assert_eq!(total_reserve(&s), reserve_before - payout);
+    assert!(s.client.is_claimed(&1));
+}
+
+#[test]
+fn claim_payout_is_capped_by_total_reserve_when_coverage_exceeds_it() {
+    let s = setup();
+
+    // Tiny premium -> tier-1 coverage (50% of the cap) dwarfs the reserve.
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000);
+
+    // Seed the backstop so the total reserve is still far below coverage.
+    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&treasury, &500);
+    s.client.top_up_backstop(&treasury, &500);
+
+    let reserve_before = total_reserve(&s);
+    let tiered = s.client.get_tiered_coverage(&s.lp);
+    assert!(tiered > reserve_before);
+
+    let payout = s.client.claim(&1, &s.lp);
+
+    // Coverage exceeds the pool -> payout is bounded by the reserve, never
+    // above it, and the pool is drained to zero (no over-draw).
+    assert_eq!(payout, reserve_before);
+    assert!(payout <= tiered);
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&s.lp), reserve_before);
+    assert!(s.client.is_claimed(&1));
+}
+
+#[test]
+fn claim_draws_liquid_first_then_backstop_conserving_counters() {
+    let s = setup();
+
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000); // liquid = 1000, backstop = 0
+    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&treasury, &2000);
+    s.client.top_up_backstop(&treasury, &2000); // backstop = 2000
+
+    let balance_before = s.client.get_pool_balance();
+    let backstop_before = s.client.get_backstop_balance();
+    let reserve_before = balance_before + backstop_before;
+
+    // Tier-1 coverage far exceeds the 3,000 reserve -> payout drains it all.
+    let payout = s.client.claim(&1, &s.lp);
+
+    let balance_after = s.client.get_pool_balance();
+    let backstop_after = s.client.get_backstop_balance();
+
+    // Counter conservation: no value is created or destroyed by the payout.
+    assert_eq!(balance_after + backstop_after + payout, reserve_before);
+    // Liquid reserve is drained before the backstop is touched, and the
+    // backstop only absorbs the shortfall.
+    assert_eq!(balance_after, 0);
+    assert_eq!(backstop_after, backstop_before - (payout - balance_before));
+    assert!(payout <= reserve_before);
+}
+
+#[test]
+fn already_claimed_rejection_leaves_counters_unchanged() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &(COVERAGE * 2));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 2));
+
+    let first = s.client.claim(&7, &s.lp);
+    assert!(first > 0);
+
+    let balance_after_first = s.client.get_pool_balance();
+    let backstop_after_first = s.client.get_backstop_balance();
+
+    // The rejection happens at the idempotency check, before any counter
+    // write, so nothing moves.
+    assert_eq!(
+        s.client.try_claim(&7, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::AlreadyClaimed)))
+    );
+    assert_eq!(s.client.get_pool_balance(), balance_after_first);
+    assert_eq!(s.client.get_backstop_balance(), backstop_after_first);
+}
+
+#[test]
+fn pool_empty_claim_rejection_leaves_counters_unchanged() {
+    let s = setup();
+
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+
+    assert_eq!(
+        s.client.try_claim(&1, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::PoolEmpty)))
+    );
+
+    // An empty pool rejects before any state write: counters stay at zero and
+    // the invoice is not consumed.
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+    assert!(!s.client.is_claimed(&1));
+}
+
+#[test]
+fn circuit_gated_claim_rejection_leaves_counters_unchanged() {
+    let s = setup();
+
+    // Trip the breaker with a first payout, then rebuild the reserve so a
+    // second (blocked) claim has something it *could* have paid out.
+    s.token_admin.mint(&s.lp, &100);
+    s.client.deposit_premium(&s.lp, &100);
+    s.client.set_min_reserve_ratio_bps(&5000);
+    let first = s.client.claim(&1, &s.lp);
+    assert!(first > 0);
+    assert!(s.client.is_solvency_circuit_open());
+
+    s.token_admin.mint(&s.lp, &500);
+    s.client.deposit_premium(&s.lp, &500);
+
+    let balance_before = s.client.get_pool_balance();
+    let backstop_before = s.client.get_backstop_balance();
+
+    // Gated by the open circuit: rejected before any payout accounting runs.
+    assert_eq!(
+        s.client.try_claim(&2, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(
+            InsuranceError::SolvencyCircuitOpen
+        )))
+    );
+    assert_eq!(s.client.get_pool_balance(), balance_before);
+    assert_eq!(s.client.get_backstop_balance(), backstop_before);
+    assert!(!s.client.is_claimed(&2));
+}
