@@ -579,6 +579,14 @@ pub fn get_payer_score(env: &Env, payer: &Address) -> u32 {
                         let mut profile = get_reputation(env, payer);
                         profile.score = new_score;
                         set_reputation(env, &profile);
+
+                        // Keep the top-payers ranking in step with the decayed
+                        // score. Without this the heap kept the pre-decay
+                        // score until the payer's next explicit score change,
+                        // so a long-idle payer stayed ranked at a stale value.
+                        crate::top_payers::update_top_payers_on_score_change(
+                            env, payer, new_score,
+                        );
                     }
                 }
             }

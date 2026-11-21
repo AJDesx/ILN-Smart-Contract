@@ -4722,6 +4722,8 @@ mod tests_invoice_count;
 mod tests_batch_submit_reputation;
 // Audit: submit_invoices_batch partial-failure / atomicity
 mod tests_batch_atomicity;
+// Audit: top-payer ranking determinism
+mod tests_top_payers;
 // Issue #pause-checks: expire_invoice and appeal_default pause guards
 mod tests_pause_checks;
 // Economic security regression suite (threat-model B0/B1/D1) — declared here
