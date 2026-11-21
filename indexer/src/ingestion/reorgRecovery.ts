@@ -31,6 +31,7 @@ import type { IngestionLockHandle } from './ingestionLock.js';
 import type { LedgerHeaderSource } from './ledgerHeaders.js';
 import { createHorizonLedgerHeaderSource } from './ledgerHeaders.js';
 import { runReplay, type ReplayOptions, type ReplayResult } from './replay.js';
+import type { RetryPolicy } from './horizonPages.js';
 import {
   LedgerReorgDetector,
   latchHalt,
@@ -54,6 +55,8 @@ export interface ReorgRecoveryOptions
   fetchImpl?: typeof fetch;
   decodeTransactionEvents?: (record: HorizonTransactionRecord) => DecodedContractEvent[];
   pageSize?: number;
+  /** Bounded retry policy for replay's Horizon reads. */
+  retry?: RetryPolicy;
   /** Upper bound on waiting for ingestion leadership. Defaults to 30s. */
   acquireTimeoutMs?: number;
 }
@@ -238,6 +241,7 @@ async function replayFromDivergence(
       : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
     ...(options.pageSize !== undefined ? { pageSize: options.pageSize } : {}),
+    ...(options.retry !== undefined ? { retry: options.retry } : {}),
   };
 
   return runReplay(replayOptions);
