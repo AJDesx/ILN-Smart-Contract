@@ -51,7 +51,7 @@ use crate::storage::get_admin;
 use events::{
     AdminChanged, AppealResolved, ContractInitialized, ContractPaused, ContractUnpaused,
     ContractUpgraded, DefaultAppealed, DisputeResolved, DisputeUpheldPayerRefund,
-    DistributionContractUpdated, FundQueueRecovered, FundQueueResolutionAttempted, FundQueueResolved,
+    DistributionContractUpdated, FundQueueRecovered, FundQueueResolutionAttempted, FundQueueResolved, FundQueueTieBroken,
     FundRequested,
     InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted, InvoiceDisputed, InvoiceExpired,
     InvoiceFunded, InvoicePaid, InvoicePartiallyPaid, InvoiceSubmitted, InvoiceTokenChanged,
@@ -2052,11 +2052,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         );
 
         // Track referral count if provided
-        if let ReferralCode::Present(code) = &referral_code {
-            let key = crate::storage::DataKey::ReferralCount(code.clone());
-            let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-            env.storage().persistent().set(&key, &(current + 1));
-        }
+        record_referral(&env, &referral_code)?;
 
         Ok(id)
     }
@@ -2211,7 +2207,24 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     // ------------------------------------------------------------
     // submit_invoices_batch
     // ------------------------------------------------------------
-    /// Access: Submitter only
+    /// Access: Submitter only (every distinct `freelancer` in the batch must authorize)
+    ///
+    /// # Atomicity (audited, Issue: batch partial-failure)
+    /// The batch is **all-or-nothing**. Any `Err` returned from this function
+    /// makes the whole contract invocation fail, and the Soroban host discards
+    /// every storage write and event made earlier in the same invocation. So a
+    /// failure on invoice N leaves no invoice, submitter-index entry,
+    /// `total_invoices`/`invoices_submitted` increment, referral count or ID
+    /// allocation from invoices `0..N`. There is no partial-success result:
+    /// the call returns either one ID per input invoice (in input order) or an
+    /// error. Callers must not parse a failed call for "which succeeded".
+    ///
+    /// # Per-invoice validation
+    /// Each entry is held to the same rules as [`Self::submit_invoice`]:
+    /// self-invoice, discount-rate cap, governance `max_invoice_amount` cap,
+    /// approved token, token-decimals-aware amount floor, and due-date window.
+    /// Errors are those of `submit_invoice`, plus `BatchTooLarge` (> 10
+    /// entries) and `ContractPaused`. An empty batch is a no-op returning `[]`.
     pub fn submit_invoices_batch(
         env: Env,
         invoices: Vec<InvoiceParams>,
@@ -2224,12 +2237,31 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::BatchTooLarge);
         }
 
+        // Read once; the cap cannot change mid-invocation.
+        let max_invoice_amount = get_max_invoice_amount(&env);
+
         let mut authenticated_freelancers: Vec<Address> = Vec::new(&env);
         let mut ids = Vec::new(&env);
         for params in invoices.iter() {
             if !authenticated_freelancers.contains(&params.freelancer) {
                 require_submitter(&env, &params.freelancer)?;
                 authenticated_freelancers.push_back(params.freelancer.clone());
+            }
+
+            // Parity with `submit_invoice`: these checks were previously
+            // missing from the batch path, letting a batch bypass them.
+            if params.freelancer == params.payer {
+                return Err(ContractError::SelfInvoice);
+            }
+
+            if params.discount_rate == 0 || params.discount_rate > crate::constants::MAX_DISCOUNT_RATE
+            {
+                return Err(ContractError::InvalidDiscountRate);
+            }
+
+            // Issue #655: governance per-invoice cap (0 = uncapped).
+            if max_invoice_amount > 0 && params.amount > max_invoice_amount {
+                return Err(ContractError::MaxInvoiceAmountExceeded);
             }
 
             if !is_approved_token(&env, &params.token) {
@@ -2305,11 +2337,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             );
 
             // Track referral count if provided
-            if let ReferralCode::Present(code) = &params.referral_code {
-                let key = crate::storage::DataKey::ReferralCount(code.clone());
-                let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-                env.storage().persistent().set(&key, &(current + 1));
-            }
+            record_referral(&env, &params.referral_code)?;
 
             ids.push_back(id);
         }
@@ -2560,7 +2588,8 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                 tied.push_back(i);
             }
         }
-        let winner_index: u32 = if tied.len() > 1 {
+        let tied_count: u32 = tied.len();
+        let winner_index: u32 = if tied_count > 1 {
             // GenRange is only implemented for u64 in this soroban-sdk
             // version — generate as u64, then narrow (safe: tied.len() is
             // bounded by MAX_FUND_QUEUE_LEN).
@@ -4491,6 +4520,29 @@ fn normalize_eurc_amount(amount: i128) -> i128 {
     amount
 }
 
+/// Referral accounting (audited; see docs/referral-audit.md).
+///
+/// The *only* writer of `DataKey::ReferralCount`. It is called exactly once per
+/// successfully created invoice, from `submit_invoice` and
+/// `submit_invoices_batch`, after every validation has passed. There is no
+/// entry point that sets, edits, decrements or resets a count, and the
+/// `referral_code` stored on an invoice is immutable after submission.
+///
+/// `ReferralCode::None` is a no-op. The increment is checked and fails closed
+/// with `ArithmeticOverflow` (practically unreachable for a `u64`) instead of
+/// wrapping or trapping.
+fn record_referral(env: &Env, referral_code: &ReferralCode) -> Result<(), ContractError> {
+    if let ReferralCode::Present(code) = referral_code {
+        let key = crate::storage::DataKey::ReferralCount(code.clone());
+        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &next);
+    }
+    Ok(())
+}
+
 /// Validate invoice terms using the decimal precision stored for `token`.
 ///
 /// The minimum accepted amount is `1` whole unit in the token's own precision:
@@ -4668,6 +4720,10 @@ mod tests_resource_limit_failure;
 mod tests_invoice_count;
 // Issue #batch-reputation: batch_submit increments invoices_submitted
 mod tests_batch_submit_reputation;
+// Audit: submit_invoices_batch partial-failure / atomicity
+mod tests_batch_atomicity;
+// Audit: top-payer ranking determinism
+mod tests_top_payers;
 // Issue #pause-checks: expire_invoice and appeal_default pause guards
 mod tests_pause_checks;
 // Economic security regression suite (threat-model B0/B1/D1) — declared here
