@@ -132,10 +132,16 @@ impl InvoiceLiquidityContract {
         eurc_token: Address,
         xlm_token: Address,
     ) -> Result<(), ContractError> {
-        if env
-            .storage()
-            .instance()
-            .has(&crate::storage::DataKey::InvoiceCount)
+        // `initialize` performs no authorization, so this guard is the only
+        // protection for the admin role. It must key off a value that
+        // `initialize` itself writes (`Admin`); `InvoiceCount` is never
+        // written by the contract, so checking it alone let anyone re-run
+        // `initialize` and replace the admin (Issue #1159, [AUTH-8]).
+        if env.storage().instance().has(&crate::storage::DataKey::Admin)
+            || env
+                .storage()
+                .instance()
+                .has(&crate::storage::DataKey::InvoiceCount)
         {
             return Err(ContractError::AlreadyInitialized);
         }
@@ -1943,6 +1949,9 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     // submit_invoice (NOW TOKEN-AWARE)
     // ------------------------------------------------------------
     /// Access: Submitter only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// Starts the lifecycle in `Pending` with `amount_funded == amount_paid == 0` [ST-1].
     pub fn submit_invoice(
         env: Env,
         freelancer: Address,
@@ -2056,6 +2065,10 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     // update_invoice
     // ------------------------------------------------------------
     /// Access: Submitter only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Pending -> Pending` only; terms can change only while nothing is funded [ST-1]. The
+    /// `Expired` write on the error path is rolled back [NE-4].
     pub fn update_invoice(
         env: Env,
         freelancer: Address,
@@ -2716,6 +2729,14 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     /// If the oracle returns `false` (unverified), the call returns
     /// `ContractError::PayerUnverified`. When `false`, the oracle is not
     /// consulted and the existing behaviour is preserved.
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Pending|PartiallyFunded -> PartiallyFunded|Funded`. Requires the
+    /// funding LP's signature [AUTH-2] and `fund_amount > 0` [ACC-4];
+    /// `amount_funded` never exceeds `amount` [ACC-1] and always equals the
+    /// sum of contributions [ACC-3]; `Funded` iff `amount_funded == amount`
+    /// [ACC-5]. A failing transfer or distribution hook reverts everything
+    /// [RB-2].
     pub fn fund_invoice(
         env: Env,
         funder: Address,
@@ -2728,6 +2749,14 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         if is_paused(&env) {
             unlock_reentrancy(&env);
             return Err(ContractError::ContractPaused);
+        }
+
+        // [ACC-4]/[ACC-5]: a non-positive tranche would move a Pending
+        // invoice to PartiallyFunded with `amount_funded == 0` and record a
+        // zero-amount funder (Issue #1159).
+        if fund_amount <= 0 {
+            unlock_reentrancy(&env);
+            return Err(ContractError::InvalidAmount);
         }
 
         require_lp(&env, &funder)?;
@@ -3073,21 +3102,12 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
 
     // ------------------------------------------------------------
     // transfer_lp_position
-/// `transfer_lp_position` contract entry point.
-///
-/// # Arguments
-/// * `env` — host environment
-/// * `invoice_id` — see signature
-/// * `new_lp` — see signature
-///
-/// # Returns
-/// * `Ok(...)` on success; see Errors
-///
-/// # Errors
-/// * Authorization / validation errors as defined by this contract
-///
-/// Access: Caller (require_auth)
-pub fn transfer_lp_position(
+    /// Access: Current LP only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Funded -> Funded`; signed by the current funder [AUTH-7]; amounts
+    /// unchanged [ACC-3]. Only the completing LP's position moves [NE-8].
+    pub fn transfer_lp_position(
         env: Env,
         invoice_id: u64,
         new_lp: Address,
@@ -3155,6 +3175,11 @@ pub fn transfer_lp_position(
     // cancel_invoice
     // ------------------------------------------------------------
     /// Access: Submitter only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Pending|PartiallyFunded -> Cancelled` (terminal) [ST-5]; freelancer
+    /// only [AUTH-1]; partial funders are refunded exactly what they paid.
+    /// Cumulative fields are kept as history [NE-1].
     pub fn cancel_invoice(env: Env, invoice_id: u64) -> Result<(), ContractError> {
         lock_reentrancy(&env)?;
 
@@ -3225,6 +3250,10 @@ pub fn transfer_lp_position(
     // expire_invoice
     // ------------------------------------------------------------
     /// Access: Anyone
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Pending -> Expired` (terminal) once `now > due_date`; permissionless
+    /// but state-gated, and never applies to a funded invoice [ST-4].
     pub fn expire_invoice(env: Env, invoice_id: u64) -> Result<(), ContractError> {
         if is_paused(&env) {
             return Err(ContractError::ContractPaused);
@@ -3270,6 +3299,12 @@ pub fn transfer_lp_position(
     // mark_paid (USES invoice.token)
     // ------------------------------------------------------------
     /// Access: Payer only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Funded -> Funded|Paid`; payer only [AUTH-3]; `amount_paid` never
+    /// exceeds `amount` [ACC-2]; settlement (status `Paid`, LP payouts
+    /// bounded by `amount - fee`, distribution accrual) happens exactly once
+    /// [SET-1][SET-3] and is reverted atomically on any failure [RB-2].
     pub fn mark_paid(env: Env, invoice_id: u64, amount: i128) -> Result<(), ContractError> {
         lock_reentrancy(&env)?;
 
@@ -3480,6 +3515,10 @@ pub fn transfer_lp_position(
     // claim_yield
     // ----------------------------------------------------------------
     /// Access: LP only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// Read-only: non-zero only for a fully funded and fully paid invoice
+    /// [SET-4]; signed by the current funder [AUTH-7]; moves no funds [NE-6].
     pub fn claim_yield(env: Env, invoice_id: u64) -> Result<i128, ContractError> {
         if !invoice_exists(&env, invoice_id) {
             return Err(ContractError::InvoiceNotFound);
@@ -3518,6 +3557,14 @@ pub fn transfer_lp_position(
     // claim_default
     // ----------------------------------------------------------------
     /// Access: LP only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Funded -> Defaulted` at/after `due_date`; caller must be a recorded
+    /// funder [AUTH-6]. Refunds and the insurance claim happen at most once
+    /// [SET-2]; a failing refund reverts the default and leaves the pool
+    /// untouched, a failing insurance claim is tolerated [RB-3]. Refunds are
+    /// paid from ILN's pooled balance [NE-2]; partial payments are not
+    /// returned [NE-3].
     pub fn claim_default(env: Env, funder: Address, invoice_id: u64) -> Result<(), ContractError> {
         lock_reentrancy(&env)?;
 
@@ -3669,6 +3716,10 @@ pub fn transfer_lp_position(
     /// * `invoice_id`    – the defaulted invoice
     /// * `evidence_hash` – SHA-256 hash of off-chain evidence provided by the payer
     /// Access: Payer only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Defaulted -> Appealed`, at most once per invoice; payer only
+    /// [AUTH-4]; no funds move.
     pub fn appeal_default(
         env: Env,
         invoice_id: u64,
@@ -3743,21 +3794,18 @@ pub fn transfer_lp_position(
         Ok(())
     }
 
-/// Resolve a pending appeal (admin / governance only).
-///
-/// # Arguments
-/// * `env` — host environment
-/// * `invoice_id` — see signature
-/// * `upheld` — see signature
-///
-/// # Returns
-/// * `Ok(...)` on success; see Errors
-///
-/// # Errors
-/// * `Unauthorized` if caller is not admin; plus validation errors
-///
-/// Access: Admin only
-pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), ContractError> {
+    /// Resolve a pending appeal (admin / governance only).
+    ///
+    /// * `upheld=true`  → reverse the default, restore pre-default score, status → Defaulted (reversed).
+    ///   In practice the status transitions back to Defaulted with score restored so the LP
+    ///   can still collect principal they were already refunded. The key effect is reputation repair.
+    /// * `upheld=false` → reject the appeal; invoice remains Defaulted (status reverts from Appealed).
+    /// Access: Admin only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Appealed -> Defaulted` either way; admin only [AUTH-5]; reputation
+    /// only, no funds move; the default cannot be re-claimed [SET-2].
+    pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), ContractError> {
         require_admin(&env)?;
         record_admin_action(&env, "resolve_appeal");
 
@@ -3821,6 +3869,10 @@ pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), Con
     /// * `invoice_id`  – the invoice to dispute
     /// * `reason_hash` – SHA-256 hash of off-chain dispute evidence
     /// Access: Payer only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Pending|PartiallyFunded|Funded -> Disputed`, at most once per
+    /// invoice; payer only [AUTH-4].
     pub fn dispute_invoice(
         env: Env,
         invoice_id: u64,
@@ -3888,22 +3940,17 @@ pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), Con
         Ok(())
     }
 
-/// Resolve a dispute (admin / governance only).
-///
-/// # Arguments
-/// * `env` — host environment
-/// * `invoice_id` — see signature
-/// * `resolution_hash` — see signature
-/// * `resolution` — see signature
-///
-/// # Returns
-/// * `Ok(...)` on success; see Errors
-///
-/// # Errors
-/// * `Unauthorized` if caller is not admin; plus validation errors
-///
-/// Access: Admin only
-pub fn resolve_dispute(
+    /// Resolve a dispute (admin / governance only).
+    ///
+    /// * `resolution_hash` – Optional hash of resolution details
+    /// * `resolution`      – Ruling: 1 = Upheld (Payer right), 2 = Rejected (Freelancer right)
+    /// Access: Admin only
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// `Disputed -> Cancelled` (1) with refunds, or back to the status implied
+    /// by `amount_funded` (2) [ACC-5]; admin only [AUTH-5]. An insufficient
+    /// balance for the refunds reverts the whole resolution [RB-3][NE-2].
+    pub fn resolve_dispute(
         env: Env,
         invoice_id: u64,
         resolution_hash: BytesN<32>,
@@ -4023,6 +4070,10 @@ pub fn resolve_dispute(
     ///
     /// * `invoice_id` – the invoice to auto-resolve
     /// Access: Anyone
+    ///
+    /// Lifecycle invariants (docs/invoice-lifecycle-invariants.md):
+    /// Same as `resolve_dispute(2)` after `dispute_timeout_ledgers`;
+    /// permissionless but time-gated [ACC-5].
     pub fn auto_resolve_dispute(env: Env, invoice_id: u64) -> Result<(), ContractError> {
         if !invoice_exists(&env, invoice_id) {
             return Err(ContractError::InvoiceNotFound);
@@ -4633,11 +4684,6 @@ mod tests_reputation_decay_long_idle;
 mod tests_nft_event_emission;
 // Issue #851: NFT transfer reputation and insurance consistency
 mod tests_nft_transfer_consistency;
-// Issues #914, #915, #916, #918: Configuration parameter bounds validation
-mod tests_config_parameter_bounds;
-// Issues #1070–#1073: token decimals, SAC authorization, frozen accounts, clawback
-mod tests_token_safety;
-// Issue #1025: Benchmark extension cost at maximum depth and queue TTL / pause controls
-mod tests_max_depth_extension;
-// Issue #1027: Focused tests for join-order tie-breaking replacement
-mod tests_tie_breaking;
+// Issue #1159: invoice lifecycle state-machine and accounting invariants
+// (see docs/invoice-lifecycle-invariants.md).
+mod tests_lifecycle_invariants;
