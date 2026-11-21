@@ -21,6 +21,16 @@ To regenerate: `cd sdk && git-cliff --config .cliff.toml`
 - An unknown contract code now yields a `ContractExecutionError` that keeps `originalCode` and tells the
   caller to upgrade the SDK, instead of a code-less generic `ILNError`.
 
+- `fundInvoice` now calls `fund_invoice` with the contract's full argument list
+  (`funder, invoice_id, fund_amount, require_oracle_verification`); the oracle flag was never sent before.
+- `fundInvoice` funds only the unfunded remainder of a PartiallyFunded invoice (it previously always sent the
+  full amount, which the contract rejects with `OverfundingRejected`) and sizes the allowance check to it.
+- `fundInvoice` checks the LP's token balance against the discounted cost (`computeFundingCost`) and throws
+  `ILNError.InsufficientAmount` before signing anything, simulates `fund_invoice` before submitting an
+  `approve` (contract rejections surface as typed `ILNError`s without costing an approve fee), and treats
+  `TRY_AGAIN_LATER` as a failure instead of returning a hash. `getAllowance` accepts an optional
+  `networkPassphrase` (it was hard-coded to testnet); `getTokenBalance` is new.
+
 ### Changed
 - Client-side-only errors `InvalidAddress`, `InvalidTransfer` and `InvoiceNotCancellable` no longer carry
   codes 37/38/39 (`code` is `undefined`), so they cannot be confused with on-chain codes.
