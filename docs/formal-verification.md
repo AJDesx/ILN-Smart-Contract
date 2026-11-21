@@ -424,10 +424,10 @@ There is no single `check_invariants()` helper analogous to the invoice contract
 |---|---|
 | State machine valid transitions (create → vote → execute) | `contracts/tests/governance_lifecycle_test.rs`, `contracts/tests/governance_main_integration_test.rs` |
 | Quorum / majority rejection paths | `contracts/iln_governance/src/test.rs` |
-| Timelock (`eta_ledger`) enforcement & execution-not-before-eta (Issue #1087) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x6_governance_execution_not_before_eta_invariant` |
+| Timelock (`eta_ledger`) enforcement & execution-not-before-eta (Issue #1087) | `contracts/iln_governance/src/test.rs` |
 | Execution retry on cross-contract failure (Issue #531) | `contracts/iln_governance/src/test.rs` |
-| Veto transition safety and `disable_veto_power` one-way switch (Issue #68, #1088) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x7_governance_veto_transition_safety` |
-| Proposal lifecycle authorization across all actors (Issue #1089) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x8_governance_proposal_lifecycle_authorization` |
+| Veto transition safety and `disable_veto_power` one-way switch (Issue #68, #1088) | `contracts/iln_governance/src/test.rs` |
+| Proposal lifecycle authorization across all actors (Issue #1089) | `contracts/iln_governance/src/test.rs` |
 | Delegation cycle/depth prevention (Issue #64) | `contracts/iln_governance/src/test.rs` |
 | Quadratic voting weight transform (Issue #530) | `contracts/iln_governance/src/test.rs` |
 | Access control (admin / ILN-contract-gated setters) | `contracts/iln_governance/src/test.rs` |
