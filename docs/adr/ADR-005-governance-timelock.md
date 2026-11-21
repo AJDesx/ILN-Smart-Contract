@@ -1,7 +1,7 @@
 # ADR-005: Governance Timelock Length (No Timelock in v1)
 
 **Date:** 2024-05-01  
-**Status:** Accepted
+**Status:** Accepted — amended by Issues #981 and #982 (see "Amendment" below)
 
 ## Context
 
@@ -78,4 +78,31 @@ A timelock **must be introduced before the admin veto power is disabled**
   governance upgrade before `disable_veto_power()` is called. Failure to do
   so leaves the protocol without any execution delay after full decentralisation.
 - The `TimelockNotExpired` error is reserved but unimplemented; contributors
-  must not assume it is enforced.
+  must not assume it is enforced. *(Superseded: `execute_proposal` now
+  enforces `eta_ledger` via the admin-configured `execution_delay`.)*
+
+## Amendment (Issues #981, #982)
+
+The "Action required" above is now enforced on-chain rather than left to
+process:
+
+- **#981 — active timelock before veto disablement.** `disable_veto_power()`
+  returns `TimelockNotActive` unless `execution_delay >=
+  MIN_ACTIVE_TIMELOCK_LEDGERS` (17,280 ledgers ≈ 24 h). After the veto is
+  disabled, `set_execution_delay` rejects any value below that floor, so the
+  invariant "veto enabled OR active timelock" holds at every state.
+  `set_execution_delay` also now returns `NotInitialized` before
+  `initialize` instead of letting the first caller claim the admin slot.
+- **#982 — timelock policy version on proposals.** The contract keeps a
+  monotonically increasing `TimelockPolicyVersion` (bumped by an effective
+  `set_execution_delay` change and by `disable_veto_power`). Every proposal
+  persists a `ProposalTimelockPolicy` snapshot (creation version/delay/veto
+  state, queue version/ledger, applied delay). Queueing applies
+  `max(created_delay, current_delay)`; if the policy version changes after
+  queueing, execution requires `max(eta_ledger, queued_ledger +
+  current_delay)`. A policy change can lengthen but never shorten an
+  in-flight proposal's timelock — in particular, retiring the veto re-applies
+  the active timelock to proposals that were queued with a zero delay.
+
+Rollout, recovery and upgrade notes:
+[docs/governance-timelock-policy.md](../governance-timelock-policy.md).

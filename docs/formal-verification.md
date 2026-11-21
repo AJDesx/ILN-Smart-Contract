@@ -258,7 +258,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 | `Active` | `delegate_votes` / `undelegate_votes` | `Active` | Does not itself touch proposal status; adjusts `DelegatedToMe` tallies used by subsequent `cast_vote` calls |
 | `Active` | `execute_proposal` (quorum not reached) | `Rejected` | `now >= voting_end`; `votes_for + votes_against < quorum(total_supply, min_quorum_bps)` |
 | `Active` | `execute_proposal` (majority not reached) | `Rejected` | `now >= voting_end`; quorum reached; `votes_for <= votes_against` |
-| `Active` | `execute_proposal` (passes) | `Passed` | `now >= voting_end`; quorum reached; `votes_for > votes_against`; sets `eta_ledger = current_ledger + execution_delay` |
+| `Active` | `execute_proposal` (passes) | `Passed` | `now >= voting_end`; quorum reached; `votes_for > votes_against`; sets `eta_ledger = current_ledger + max(created_delay, execution_delay)` and records the queue-time policy version (Issue #982) |
 | `Active` | `veto_proposal` | `Vetoed` | Caller is stored admin; `VetoPowerEnabled == true` |
 | `Passed` | `execute_proposal` (timelock elapsed, call succeeds) | `Executed` | `current_ledger >= eta_ledger`; cross-contract call to the target contract returns `Ok(())` |
 | `Passed` | `execute_proposal` (timelock elapsed, call fails) | `Passed` | `current_ledger >= eta_ledger`; cross-contract call traps or errors — status/`eta_ledger` unchanged so a retry is possible (Issue #531) |
@@ -275,7 +275,9 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 | `Active` | `cast_vote` after `voting_end` | `VotingEnded` |
 | Any non-`Active` | `cast_vote` | `ProposalNotActive` |
 | `Active`/`Passed`/`Rejected`/`Executed`/`Vetoed` | `cast_vote` twice by same voter on same proposal | `AlreadyVoted` |
-| `Passed` | `execute_proposal` before `eta_ledger` | `TimelockNotExpired` |
+| `Passed` | `execute_proposal` before the effective eta (`eta_ledger`, or `max(eta_ledger, queued_ledger + execution_delay)` if the timelock policy version changed since queueing — Issue #982) | `TimelockNotExpired` |
+| — | `disable_veto_power` while `execution_delay < MIN_ACTIVE_TIMELOCK_LEDGERS` (Issue #981) | `TimelockNotActive` |
+| — | `set_execution_delay(d)` with `d < MIN_ACTIVE_TIMELOCK_LEDGERS` after the veto is disabled (Issue #981) | `TimelockNotActive` |
 | `Rejected`, `Executed`, `Vetoed` | `execute_proposal` | `AlreadyResolved` |
 | `Rejected`, `Executed`, `Vetoed` | `veto_proposal` | `NotVetoable` |
 | Any vetoable state | `veto_proposal` when `VetoPowerEnabled == false` | `VetoPowerDisabled` |
@@ -342,7 +344,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 | Action | Guard |
 |---|---|
 | `veto_proposal` | Caller must equal stored `Admin`; `VetoPowerEnabled` must be `true` |
-| `set_execution_delay` | Caller must equal stored `Admin` (or become admin on first call if unset) |
+| `set_execution_delay` | Caller must equal stored `Admin`; returns `NotInitialized` before `initialize` (Issue #981 removed the first-caller-becomes-admin path); cannot go below `MIN_ACTIVE_TIMELOCK_LEDGERS` once the veto is disabled |
 
 ### Invariant GA4: ILN-Contract-Gated Authorization
 These parameters can only be changed by the configured `IlnContract` address (i.e. routed through a passed governance proposal on the ILN contract itself, or an equivalent trusted caller) — never by an arbitrary account:
@@ -354,7 +356,7 @@ These parameters can only be changed by the configured `IlnContract` address (i.
 | `set_gov_token_total_supply` | `iln_contract.require_auth()` |
 | `set_quadratic_voting_enabled` | `iln_contract.require_auth()` |
 | `set_max_delegation_depth` | `iln_contract.require_auth()` |
-| `disable_veto_power` | `iln_contract.require_auth()` (one-way switch; cannot be re-enabled) |
+| `disable_veto_power` | `iln_contract.require_auth()` and `execution_delay >= MIN_ACTIVE_TIMELOCK_LEDGERS` (one-way switch; cannot be re-enabled — Issue #981) |
 
 ### Invariant GA5: Execution Authorization
 `execute_proposal` itself has no caller restriction — it is permissionless (any account may trigger the transition once the guards in §8.2 are met). Authorization instead lives in the *target* of the cross-contract call: e.g. `UpdateReputationBonusParams` passes `env.current_contract_address()` as the `caller` argument, so the downstream contract's own admin check must recognize the governance contract's address (`src/lib.rs:1153-1164`).
@@ -372,6 +374,10 @@ These parameters can only be changed by the configured `IlnContract` address (i.
 **GSP3 — No double execution:** Once a proposal reaches `Executed`, no further call can change its `action_type` effects — `execute_proposal` on an `Executed` proposal returns `AlreadyResolved` without re-invoking the cross-contract call.
 
 **GSP4 — Veto is a strict override:** `veto_proposal` can transition `Active` or `Passed` directly to `Vetoed`, bypassing quorum/majority checks entirely, but only while `VetoPowerEnabled == true`; once `disable_veto_power` runs, this path is permanently closed (Invariant GA4).
+
+**GSP4a — Brake continuity (Issue #981):** At every reachable state, `VetoPowerEnabled == true || execution_delay >= MIN_ACTIVE_TIMELOCK_LEDGERS`. Proven by the guard in `disable_veto_power` plus the floor in `set_execution_delay`; tested in `contracts/iln_governance/src/test.rs` (`test_disable_veto_power_*`, `test_execution_delay_cannot_drop_below_floor_after_veto_disabled`).
+
+**GSP4b — Timelock monotonicity (Issue #982):** For a given proposal, no timelock policy change between `create_proposal` and execution can make it executable earlier than under the policy in force when it was created or queued. Tested by `test_delay_reduction_*`, `test_veto_disablement_extends_already_queued_proposal`, and the legacy-upgrade tests.
 
 **GSP5 — Auth enforcement:** Every state-mutating action requires the caller (or a designated authority — admin, the configured ILN contract, or the acting address itself) to pass an explicit `require_auth()` check. No action can be invoked without satisfying its auth predicate.
 

@@ -6,6 +6,10 @@
 //!             and cycle detection.
 //! Issue #68 — veto_proposal() admin emergency block with governance-controlled
 //!             disable mechanism.
+//! Issue #981 — disable_veto_power() requires an active execution timelock, and
+//!             the timelock cannot be lowered below that floor once the veto is gone.
+//! Issue #982 — every proposal persists the timelock policy version it was
+//!             created and queued under; policy drift can only lengthen its delay.
 
 #![no_std]
 
@@ -33,6 +37,16 @@ const DEFAULT_PROPOSAL_DEPOSIT: i128 = 0;
 
 /// Default maximum transitive delegation chain depth.
 const DEFAULT_MAX_DELEGATION_DEPTH: u32 = 10;
+
+/// Issue #981: minimum execution delay (in ledgers) that counts as an
+/// "active" timelock — ~24 h at ~5 s/ledger. `disable_veto_power` refuses to
+/// run below this floor, and once the veto is disabled `set_execution_delay`
+/// cannot drop below it, so the protocol is never left with neither a veto
+/// nor an execution delay (ADR-005).
+pub const MIN_ACTIVE_TIMELOCK_LEDGERS: u32 = 17_280;
+/// Issue #982: timelock policy version written at `initialize`. Contracts
+/// upgraded from a pre-#982 build have no stored version and read as `0`.
+const INITIAL_TIMELOCK_POLICY_VERSION: u32 = 1;
 
 // ================================================================
 // Governance error enum
@@ -88,6 +102,11 @@ pub enum GovernanceError {
     DepositAlreadySettled = 27,
     /// #844: contract called before `initialize()`.
     NotInitialized = 28,
+    /// Issue #981: the execution delay is below `MIN_ACTIVE_TIMELOCK_LEDGERS`
+    /// — returned by `disable_veto_power` while no active timelock exists, and
+    /// by `set_execution_delay` when lowering the delay below the floor after
+    /// the veto has been disabled.
+    TimelockNotActive = 29,
 }
 
 // ================================================================
@@ -302,6 +321,42 @@ pub struct VetoPowerDisabled {
     pub disabled_by: Address,
 }
 
+/// Issue #982: emitted whenever the timelock policy (execution delay or
+/// veto availability) changes, carrying the new policy version.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelockPolicyUpdated {
+    pub version: u32,
+    pub execution_delay: u32,
+    pub veto_enabled: bool,
+}
+
+/// Issue #982: the timelock policy a proposal was created and queued under.
+///
+/// Stored per proposal (bounded 1:1 with `Proposal(id)`) under
+/// `StorageKey::ProposalTimelockPolicy(id)` rather than as new fields on
+/// `GovernanceProposal`, so proposals persisted by an earlier build still
+/// decode after an upgrade.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalTimelockPolicy {
+    /// Policy version in force at `create_proposal`.
+    pub created_version: u32,
+    /// Execution delay (ledgers) in force at `create_proposal`.
+    pub created_delay: u32,
+    /// Whether the veto was enabled at `create_proposal`.
+    pub created_veto_enabled: bool,
+    /// `true` once `execute_proposal` has moved the proposal to `Passed`.
+    pub queued: bool,
+    /// Policy version in force when the proposal was queued (`Passed`).
+    pub queued_version: u32,
+    /// Ledger sequence at which the proposal was queued.
+    pub queued_ledger: u32,
+    /// Delay actually applied at queue time:
+    /// `max(created_delay, delay in force at queue time)`.
+    pub applied_delay: u32,
+}
+
 /// Issue #642: emitted when the veto multisig signer set / threshold is
 /// (re)configured.
 #[contracttype]
@@ -418,6 +473,12 @@ pub enum StorageKey {
     /// Issue #814: `true` once a proposal's deposit has been settled
     /// (refunded or forfeited) — guards against double-refund.
     ProposalDepositSettled(u64),
+    /// Issue #982: monotonically increasing timelock policy version, bumped
+    /// on every effective `set_execution_delay` change and on
+    /// `disable_veto_power`.
+    TimelockPolicyVersion,
+    /// Issue #982: per-proposal timelock policy snapshot.
+    ProposalTimelockPolicy(u64),
 }
 
 // ================================================================
@@ -493,6 +554,10 @@ impl GovContract {
         env.storage()
             .instance()
             .set(&StorageKey::VetoPowerEnabled, &true);
+        env.storage().instance().set(
+            &StorageKey::TimelockPolicyVersion,
+            &INITIAL_TIMELOCK_POLICY_VERSION,
+        );
         env.storage()
             .instance()
             .set(&StorageKey::MinQuorumBps, &DEFAULT_MIN_QUORUM_BPS);
@@ -701,6 +766,21 @@ impl GovContract {
             .instance()
             .set(&StorageKey::ProposalCount, &id);
 
+        // Issue #982: pin the timelock policy in force at creation so a later
+        // delay reduction cannot shorten this proposal's execution window.
+        let policy = ProposalTimelockPolicy {
+            created_version: Self::timelock_policy_version(&env),
+            created_delay: Self::execution_delay(&env),
+            created_veto_enabled: Self::veto_enabled(&env),
+            queued: false,
+            queued_version: 0,
+            queued_ledger: 0,
+            applied_delay: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ProposalTimelockPolicy(id), &policy);
+
         // Issue #814: escrow the deposit after persisting the proposal so a
         // failed transfer rolls the whole creation back atomically.
         if deposit > 0 {
@@ -856,7 +936,11 @@ impl GovContract {
         env.storage()
             .persistent()
             .remove(&StorageKey::ProposalDeposit(proposal_id));
-        let token_addr = Self::get_gov_token(env)?;
+        // A non-zero deposit can only have been escrowed after `initialize`
+        // stored `GovToken`, so this lookup cannot fail in practice.
+        let Ok(token_addr) = Self::get_gov_token(env) else {
+            return false;
+        };
         let token = TokenClient::new(env, &token_addr);
         let this = env.current_contract_address();
         token.transfer(&this, proposer, &amount);
@@ -901,7 +985,9 @@ impl GovContract {
             .remove(&StorageKey::ProposalDeposit(proposal_id));
         let sink: Option<Address> = env.storage().instance().get(&StorageKey::ProposalDepositSink);
         if let Some(dest) = sink.clone() {
-            let token_addr = Self::get_gov_token(env)?;
+            let Ok(token_addr) = Self::get_gov_token(env) else {
+                return false;
+            };
             let token = TokenClient::new(env, &token_addr);
             let this = env.current_contract_address();
             token.transfer(&this, &dest, &amount);
@@ -1248,26 +1334,30 @@ impl GovContract {
     ) -> Result<(), GovernanceError> {
         admin.require_auth();
 
-        if let Some(stored_admin) = env
+        // Issue #981: fail closed before `initialize` instead of letting the
+        // first caller claim the admin slot.
+        let stored_admin: Address = env
             .storage()
             .instance()
-            .get::<StorageKey, Address>(&StorageKey::Admin)
-        {
-            if admin != stored_admin {
-                return Err(GovernanceError::Unauthorized);
-            }
-        } else {
-            env.storage().instance().set(&StorageKey::Admin, &admin);
+            .get(&StorageKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(GovernanceError::Unauthorized);
         }
 
-        let old_value: u32 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::ExecutionDelay)
-            .unwrap_or(0_u32);
+        // Issue #981: with the veto gone the delay is the only brake, so it
+        // may never be lowered below the active-timelock floor again.
+        if !Self::veto_enabled(&env) && delay < MIN_ACTIVE_TIMELOCK_LEDGERS {
+            return Err(GovernanceError::TimelockNotActive);
+        }
+
+        let old_value = Self::execution_delay(&env);
         env.storage()
             .instance()
             .set(&StorageKey::ExecutionDelay, &delay);
+        if delay != old_value {
+            Self::bump_timelock_policy_version(&env);
+        }
 
         let pn = Symbol::new(&env, "execution_delay");
         env.events().publish(
@@ -1282,10 +1372,22 @@ impl GovContract {
     }
 
     pub fn get_execution_delay(env: Env) -> u32 {
+        Self::execution_delay(&env)
+    }
+
+    /// Issue #982: current timelock policy version (`0` on a contract
+    /// upgraded from a build that predates policy versioning and has not
+    /// changed its policy since).
+    pub fn get_timelock_policy_version(env: Env) -> u32 {
+        Self::timelock_policy_version(&env)
+    }
+
+    /// Issue #982: the timelock policy snapshot persisted for `proposal_id`.
+    /// `None` for proposals created by a pre-#982 build and not yet queued.
+    pub fn get_proposal_timelock_policy(env: Env, proposal_id: u64) -> Option<ProposalTimelockPolicy> {
         env.storage()
-            .instance()
-            .get(&StorageKey::ExecutionDelay)
-            .unwrap_or(0)
+            .persistent()
+            .get(&StorageKey::ProposalTimelockPolicy(proposal_id))
     }
 
     // ── execute_proposal ─────────────────────────────────────────
@@ -1350,12 +1452,34 @@ impl GovContract {
 
             proposal.status = ProposalStatus::Passed;
 
-            let delay = env
+            // Issue #982: apply the stricter of the creation-time and the
+            // current delay, and record the policy version queued under.
+            // Proposals created before #982 have no snapshot and are queued
+            // under the current policy (the pre-#982 behavior).
+            let current_delay = Self::execution_delay(&env);
+            let current_ledger = env.ledger().sequence();
+            let mut policy = env
                 .storage()
-                .instance()
-                .get(&StorageKey::ExecutionDelay)
-                .unwrap_or(0_u32);
-            proposal.eta_ledger = env.ledger().sequence().saturating_add(delay);
+                .persistent()
+                .get::<StorageKey, ProposalTimelockPolicy>(&StorageKey::ProposalTimelockPolicy(proposal_id))
+                .unwrap_or(ProposalTimelockPolicy {
+                    created_version: Self::timelock_policy_version(&env),
+                    created_delay: current_delay,
+                    created_veto_enabled: Self::veto_enabled(&env),
+                    queued: false,
+                    queued_version: 0,
+                    queued_ledger: 0,
+                    applied_delay: 0,
+                });
+            let delay = policy.created_delay.max(current_delay);
+            policy.queued = true;
+            policy.queued_version = Self::timelock_policy_version(&env);
+            policy.queued_ledger = current_ledger;
+            policy.applied_delay = delay;
+            env.storage()
+                .persistent()
+                .set(&StorageKey::ProposalTimelockPolicy(proposal_id), &policy);
+            proposal.eta_ledger = current_ledger.saturating_add(delay);
 
             env.storage()
                 .persistent()
@@ -1368,7 +1492,7 @@ impl GovContract {
 
         if proposal.status == ProposalStatus::Passed {
             let current_ledger = env.ledger().sequence();
-            if current_ledger < proposal.eta_ledger {
+            if current_ledger < Self::effective_eta_ledger(&env, proposal_id, &proposal) {
                 return Err(GovernanceError::TimelockNotExpired);
             }
 
@@ -1777,9 +1901,19 @@ impl GovContract {
         let iln_contract = Self::get_iln_contract(&env)?;
         iln_contract.require_auth();
 
+        // Issue #981 / ADR-005: the veto may only be retired once an active
+        // execution timelock is in place to take over as the safety brake.
+        if Self::execution_delay(&env) < MIN_ACTIVE_TIMELOCK_LEDGERS {
+            return Err(GovernanceError::TimelockNotActive);
+        }
+
+        let was_enabled = Self::veto_enabled(&env);
         env.storage()
             .instance()
             .set(&StorageKey::VetoPowerEnabled, &false);
+        if was_enabled {
+            Self::bump_timelock_policy_version(&env);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "veto_power_disabled"),),
@@ -1793,10 +1927,7 @@ impl GovContract {
 
     /// Returns `true` when admin veto power is still active.
     pub fn is_veto_power_enabled(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&StorageKey::VetoPowerEnabled)
-            .unwrap_or(false)
+        Self::veto_enabled(&env)
     }
 
     // ── Getters ──────────────────────────────────────────────────
@@ -1863,6 +1994,71 @@ impl GovContract {
     }
 
     // ── Private helpers ──────────────────────────────────────────
+
+    fn execution_delay(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ExecutionDelay)
+            .unwrap_or(0)
+    }
+
+    fn veto_enabled(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::VetoPowerEnabled)
+            .unwrap_or(false)
+    }
+
+    fn timelock_policy_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimelockPolicyVersion)
+            .unwrap_or(0)
+    }
+
+    /// Issue #982: bump the policy version and announce the new policy.
+    fn bump_timelock_policy_version(env: &Env) {
+        let version = Self::timelock_policy_version(env).saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&StorageKey::TimelockPolicyVersion, &version);
+        env.events().publish(
+            (Symbol::new(env, "timelock_policy_updated"), version),
+            TimelockPolicyUpdated {
+                version,
+                execution_delay: Self::execution_delay(env),
+                veto_enabled: Self::veto_enabled(env),
+            },
+        );
+    }
+
+    /// Issue #982: the ledger a `Passed` proposal may execute at.
+    ///
+    /// If the policy has not changed since the proposal was queued this is
+    /// `eta_ledger`. If it has, the current delay is re-applied from the
+    /// queue ledger and the later of the two wins — a policy change can
+    /// lengthen a queued proposal's delay but never shorten it. Proposals
+    /// queued by a pre-#982 build have no snapshot (unknown queue ledger) and
+    /// fail closed to `eta_ledger + current delay`.
+    fn effective_eta_ledger(env: &Env, proposal_id: u64, proposal: &GovernanceProposal) -> u32 {
+        let current_delay = Self::execution_delay(env);
+        let policy: Option<ProposalTimelockPolicy> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::ProposalTimelockPolicy(proposal_id));
+        match policy {
+            Some(p) if p.queued => {
+                if p.queued_version == Self::timelock_policy_version(env) {
+                    proposal.eta_ledger
+                } else {
+                    proposal
+                        .eta_ledger
+                        .max(p.queued_ledger.saturating_add(current_delay))
+                }
+            }
+            _ => proposal.eta_ledger.saturating_add(current_delay),
+        }
+    }
 
     /// Issue #531: invoke a cross-contract call and report whether it
     /// succeeded, instead of letting a trapped/failed call silently mark the
