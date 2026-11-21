@@ -10,6 +10,24 @@ To regenerate: `cd sdk && git-cliff --config .cliff.toml`
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- `ILNError.fromError` now maps every `ContractError` variant of the invoice contract (codes 1-48).
+  Codes 37-39 were previously reported as `InvoiceNotCancellable`, `InvalidAddress` and `InvalidTransfer`
+  although on-chain they are `Reentrancy`, `RateLimited` and `QueueNotMature`; codes 40-48 were unmapped.
+- Contract errors are now recognised in Soroban's real `Error(Contract, #N)` format (the `#` form was
+  not matched before, so real failures fell through to a generic error).
+- An unknown contract code now yields a `ContractExecutionError` that keeps `originalCode` and tells the
+  caller to upgrade the SDK, instead of a code-less generic `ILNError`.
+
+### Changed
+- Client-side-only errors `InvalidAddress`, `InvalidTransfer` and `InvoiceNotCancellable` no longer carry
+  codes 37/38/39 (`code` is `undefined`), so they cannot be confused with on-chain codes.
+  `fromError` no longer maps `Error(Contract, 999)` to `InsufficientAmount` (the contract never emits 999).
+
+---
+
 ## [0.1.0] - 2024
 
 ### Added
