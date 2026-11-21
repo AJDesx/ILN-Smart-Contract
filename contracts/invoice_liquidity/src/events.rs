@@ -596,22 +596,22 @@ pub struct FundQueueResolutionAttempted {
     pub success: bool,
 }
 
-/// Issue #1092: emitted by `resolve_fund_queue` only when more than one LP
-/// was tied at the top score and the winner was drawn by `env.prng()`.
-/// Lets off-chain monitors measure tie frequency and per-LP tie-win rates
-/// (see docs/formal-verification-cross-contract.md, assumption Q-A3).
+/// Issue #1027: emitted by `resolve_fund_queue` only when more than one LP
+/// was tied at the top (current) score and the winner was drawn by
+/// `env.prng()`. Lets off-chain monitors measure tie frequency and per-LP
+/// tie-win rates.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FundQueueTieBroken {
     pub invoice_id: u64,
     /// Number of entries tied at the top score (always >= 2).
     pub tied_count: u32,
-    /// Index of the winner within the tied prefix, in `[0, tied_count)`.
+    /// Index of the winner within the queue.
     pub winner_index: u32,
     pub approved_lp: Address,
 }
 
-/// Issue #1091: emitted when a full fund queue admits a strictly
+/// Issue #1095: emitted when a full fund queue admits a strictly
 /// higher-scored LP and displaces its lowest-scored entry.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -621,6 +621,19 @@ pub struct FundQueueEntryDisplaced {
     pub displaced_score: u32,
     pub new_lp: Address,
     pub new_score: u32,
+}
+
+/// Emitted by `recover_fund_queue` (Issues #1020/#1021). `evicted_lp` is the
+/// stalled approved LP removed from the queue (if any); `purged` is true when
+/// the invoice was no longer fundable and all queue state was deleted rather
+/// than reopened for the remaining `remaining_lps`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueRecovered {
+    pub invoice_id: u64,
+    pub evicted_lp: Option<Address>,
+    pub remaining_lps: u32,
+    pub purged: bool,
 }
 
 #[contracttype]

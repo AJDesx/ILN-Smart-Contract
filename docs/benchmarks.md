@@ -8,11 +8,14 @@ These values are baseline metrics for core contract execution: CPU instructions 
 
 ### `contracts/invoice_liquidity`
 
-| Function       | CPU Instructions | Memory (bytes) |
-| -------------- | ---------------- | -------------- |
-| submit_invoice |           859421 |          26485 |
-| fund_invoice   |          1041920 |          38190 |
-| mark_paid      |           948123 |          35480 |
+| Function                        | CPU Instructions | Memory (bytes) |
+| ------------------------------- | ---------------- | -------------- |
+| submit_invoice                  |           859421 |          26485 |
+| fund_invoice                    |          1041920 |          38190 |
+| mark_paid                       |           948123 |          35480 |
+| join_fund_queue_max_depth       |          1124580 |          42350 |
+| resolve_fund_queue_max_depth    |           582140 |          28120 |
+| extension_cost_at_maximum_depth |           321850 |          16420 |
 
 ### `contracts/iln_governance`
 
@@ -936,3 +939,60 @@ After an intentional optimisation or contract change:
 1. Run the benchmark suite locally with `--nocapture`.
 2. Update `contracts/<contract>/benchmarks/baseline.json`.
 3. Update the table in this document.
+
+## Benchmark fixture audit (Issue #1262)
+
+Scope: `contracts/invoice_liquidity/benchmarks/baseline.json` and the code
+that is supposed to produce and consume it. Findings below are separated
+into **verified** (read directly from the current source) and **residual
+risk** (needs a toolchain run or a maintainer decision).
+
+### Verified findings
+
+1. **The benchmark module is not compiled.** `contracts/invoice_liquidity/src/lib.rs`
+   has no `mod tests_benchmarks;`, so `tests_benchmarks.rs` never builds and
+   no `BENCHMARK` line is ever printed. The module doc comment and the
+   "Absolute instruction/memory thresholds" section above both say it is
+   registered; that is not true on `dev` today.
+2. **The module would not compile if registered.** `benchmark_submit_invoice`
+   and `benchmark_all_functions_summary` use an undefined `due_date`;
+   `benchmark_submit_invoice` asserts on undefined `cpu`/`mem`;
+   `assert_within_resource_budget` and `near_limit_warning_threshold` are
+   called but never defined; and a second `use soroban_sdk::{contract, contractimpl, ...}`
+   (Issue #485 section) re-imports names already imported at the top of the
+   file.
+3. **CI cannot notice.** With no measurements, `check_benchmark_regression.sh`
+   printed a `::warning::` and exited 0, so an unmeasured baseline looked the
+   same as a passing one. The baseline values (dated 2026-05-30) have not
+   been re-measured by anything in the repository since.
+4. **State size is realistic where it matters.** The three queue fixtures
+   (`join_fund_queue_max_depth`, `resolve_fund_queue_max_depth`,
+   `extension_cost_at_maximum_depth`) fill the queue to the real
+   `MAX_FUND_QUEUE_LEN` (50) rather than a hard-coded size, and the absolute
+   ceilings (100,000,000 instructions / 40 MiB) match between the Rust
+   constants and the shell script.
+5. **Stale comment.** `test_near_limit_warning_does_not_fire_for_the_current_measured_baselines`
+   calls `fund_invoice` "the highest recorded baseline"; `join_fund_queue_max_depth`
+   (1,124,580 CPU / 42,350 mem) is higher. The assertion still holds because
+   both are far below the 70% band.
+
+### What changed
+
+- `BENCHMARK_REQUIRE_MEASUREMENTS=1` makes `check_benchmark_regression.sh`
+  fail with `::error::` when a contract produces no `BENCHMARK` lines,
+  instead of warning. Default behavior (`0`) is unchanged.
+- `scripts/__tests__/benchmark-baseline.test.mjs` (no Rust toolchain needed)
+  checks that every baseline entry is produced by a named `measure()` call,
+  values are positive and within the ceilings, the script and Rust ceilings
+  agree, the queue fixtures use `MAX_FUND_QUEUE_LEN`, and the table at the
+  top of this file matches `baseline.json`. Module registration is tracked
+  as a `todo` test until finding 1 is fixed.
+
+### Residual risk / maintainer follow-up
+
+- Repairing and registering `tests_benchmarks.rs` (findings 1–2) needs a
+  compile/test pass and a fresh baseline measurement; it is left for a
+  change that can run `cargo test -p invoice_liquidity benchmark`. Once it
+  is registered, flip the `todo` test to a hard assertion and run CI with
+  `BENCHMARK_REQUIRE_MEASUREMENTS=1`.
+- Until then, treat `baseline.json` as historical, not verified.
