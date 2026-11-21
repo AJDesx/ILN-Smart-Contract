@@ -2211,7 +2211,24 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     // ------------------------------------------------------------
     // submit_invoices_batch
     // ------------------------------------------------------------
-    /// Access: Submitter only
+    /// Access: Submitter only (every distinct `freelancer` in the batch must authorize)
+    ///
+    /// # Atomicity (audited, Issue: batch partial-failure)
+    /// The batch is **all-or-nothing**. Any `Err` returned from this function
+    /// makes the whole contract invocation fail, and the Soroban host discards
+    /// every storage write and event made earlier in the same invocation. So a
+    /// failure on invoice N leaves no invoice, submitter-index entry,
+    /// `total_invoices`/`invoices_submitted` increment, referral count or ID
+    /// allocation from invoices `0..N`. There is no partial-success result:
+    /// the call returns either one ID per input invoice (in input order) or an
+    /// error. Callers must not parse a failed call for "which succeeded".
+    ///
+    /// # Per-invoice validation
+    /// Each entry is held to the same rules as [`Self::submit_invoice`]:
+    /// self-invoice, discount-rate cap, governance `max_invoice_amount` cap,
+    /// approved token, token-decimals-aware amount floor, and due-date window.
+    /// Errors are those of `submit_invoice`, plus `BatchTooLarge` (> 10
+    /// entries) and `ContractPaused`. An empty batch is a no-op returning `[]`.
     pub fn submit_invoices_batch(
         env: Env,
         invoices: Vec<InvoiceParams>,
@@ -2224,12 +2241,31 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::BatchTooLarge);
         }
 
+        // Read once; the cap cannot change mid-invocation.
+        let max_invoice_amount = get_max_invoice_amount(&env);
+
         let mut authenticated_freelancers: Vec<Address> = Vec::new(&env);
         let mut ids = Vec::new(&env);
         for params in invoices.iter() {
             if !authenticated_freelancers.contains(&params.freelancer) {
                 require_submitter(&env, &params.freelancer)?;
                 authenticated_freelancers.push_back(params.freelancer.clone());
+            }
+
+            // Parity with `submit_invoice`: these checks were previously
+            // missing from the batch path, letting a batch bypass them.
+            if params.freelancer == params.payer {
+                return Err(ContractError::SelfInvoice);
+            }
+
+            if params.discount_rate == 0 || params.discount_rate > crate::constants::MAX_DISCOUNT_RATE
+            {
+                return Err(ContractError::InvalidDiscountRate);
+            }
+
+            // Issue #655: governance per-invoice cap (0 = uncapped).
+            if max_invoice_amount > 0 && params.amount > max_invoice_amount {
+                return Err(ContractError::MaxInvoiceAmountExceeded);
             }
 
             if !is_approved_token(&env, &params.token) {
@@ -4668,6 +4704,8 @@ mod tests_resource_limit_failure;
 mod tests_invoice_count;
 // Issue #batch-reputation: batch_submit increments invoices_submitted
 mod tests_batch_submit_reputation;
+// Audit: submit_invoices_batch partial-failure / atomicity
+mod tests_batch_atomicity;
 // Issue #pause-checks: expire_invoice and appeal_default pause guards
 mod tests_pause_checks;
 // Economic security regression suite (threat-model B0/B1/D1) — declared here
