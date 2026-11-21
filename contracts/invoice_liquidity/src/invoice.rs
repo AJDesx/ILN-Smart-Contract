@@ -14,32 +14,48 @@ pub enum ReferralCode {
 // ----------------------------------------------------------------
 // FORMAL VERIFICATION INVARIANTS
 //
+// Full transition table (entrypoint, roles, accounting effect), invariant IDs
+// and the list of invariants NOT mechanically enforced:
+// docs/invoice-lifecycle-invariants.md (Issue #1159). Tests:
+// tests_lifecycle_invariants.rs, contracts/tests/cross_contract_invariants_test.rs.
+//
 // == State Machine Invariants ==
 // INVARIANT SM1: InvoiceStatus transitions are strictly validated.
 //   Valid paths:
 //     Pending -> {Funded, PartiallyFunded, Cancelled, Expired, Disputed}
 //     PartiallyFunded -> {Funded, Cancelled, Disputed}
-//     Funded -> {Paid, Defaulted, Disputed}
-//     Defaulted -> {Appealed}
+//     Funded -> {Funded (partial mark_paid / transfer_lp_position), Paid,
+//                Defaulted, Disputed}
+//     Defaulted -> {Appealed} (at most once per invoice)
 //     Appealed -> {Defaulted} (via resolve_appeal — admin only)
-//     Disputed -> {Cancelled, Funded, PartiallyFunded, Pending} (admin resolution)
+//     Disputed -> {Cancelled} (resolve_dispute(1), admin) or the status implied
+//                 by amount_funded: {Funded, PartiallyFunded, Pending}
+//                 (resolve_dispute(2), admin; or auto_resolve_dispute after timeout)
 //   Terminal states: {Paid, Expired, Cancelled}
 // INVARIANT SM2: No invalid transition is ever silently ignored — each
 //   returns a distinct ContractError variant.
 //
 // == Balance Invariants ==
-// INVARIANT B1: amount_funded <= amount  (enforced by OverfundingRejected)
-// INVARIANT B2: amount_paid <= amount    (enforced by OverpaymentRejected)
-// INVARIANT B3: amount_funded == amount  iff status == Funded
-// INVARIANT B4: amount_paid == amount    iff status == Paid
+// INVARIANT B1: 0 <= amount_funded <= amount (fund_amount > 0 guard,
+//   OverfundingRejected) [ACC-1]; contributions sum to amount_funded [ACC-3]
+// INVARIANT B2: 0 <= amount_paid <= amount (OverpaymentRejected) [ACC-2]
+// INVARIANT B3: PartiallyFunded => 0 < amount_funded < amount;
+//   Funded|Paid|Defaulted|Appealed => amount_funded == amount [ACC-5]
+// INVARIANT B4: amount_paid == amount iff status == Paid [ST-2]
+//   (amount_funded / amount_paid are cumulative history and are not reset by
+//   refunds on Cancelled — see NE-1 in the invariants doc)
 //
 // == Authorization Invariants ==
 // INVARIANT A1: cancel_invoice requires caller == invoice.freelancer
 // INVARIANT A2: mark_paid requires caller == invoice.payer
-// INVARIANT A3: claim_default requires caller in invoice funders list
+// INVARIANT A3: claim_default requires the caller's signature and that the
+//   caller is in the invoice funders list
 // INVARIANT A4: Admin-only functions call require_admin() at entry
 // INVARIANT A5: dispute_invoice requires caller == invoice.payer
 // INVARIANT A6: appeal_default requires caller == invoice.payer
+// INVARIANT A7: fund_invoice requires the funding LP's signature;
+//   transfer_lp_position / claim_yield require invoice.funder's signature
+// INVARIANT A8: initialize cannot be re-run once Admin is set
 //
 // == Storage Invariants ==
 // INVARIANT S1: Each invoice occupies an independent DataKey::Invoice(id).

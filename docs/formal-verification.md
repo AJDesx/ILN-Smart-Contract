@@ -37,6 +37,12 @@ pub enum InvoiceStatus {
 
 ### 2.2 Valid State Transition Table
 
+> The complete, code-verified table — with required authorization and the
+> accounting effect of every entrypoint, rollback semantics and the list of
+> invariants that are *not* mechanically enforced — lives in
+> [`invoice-lifecycle-invariants.md`](./invoice-lifecycle-invariants.md)
+> (Issue #1159). The summary below is kept for the proof specification.
+
 | From State | Action | To State | Guards |
 |---|---|---|---|
 | `Pending` | `submit_invoice` | `Pending` | Caller is freelancer; terms valid |
@@ -53,7 +59,7 @@ pub enum InvoiceStatus {
 | `PartiallyFunded` | `dispute_invoice` | `Disputed` | Caller is payer |
 | `Funded` | `mark_paid` (full) | `Paid` | `amount_paid == amount` |
 | `Funded` | `mark_paid` (partial) | `Funded` | `amount_paid < amount` |
-| `Funded` | `claim_default` | `Defaulted` | `timestamp > due_date` |
+| `Funded` | `claim_default` | `Defaulted` | `timestamp >= due_date`; caller is a recorded funder |
 | `Funded` | `dispute_invoice` | `Disputed` | Caller is payer |
 | `Paid` | — | — | Terminal state |
 | `Defaulted` | `appeal_default` | `Appealed` | Within appeal window |
