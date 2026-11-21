@@ -2052,11 +2052,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
         );
 
         // Track referral count if provided
-        if let ReferralCode::Present(code) = &referral_code {
-            let key = crate::storage::DataKey::ReferralCount(code.clone());
-            let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-            env.storage().persistent().set(&key, &(current + 1));
-        }
+        record_referral(&env, &referral_code)?;
 
         Ok(id)
     }
@@ -2341,11 +2337,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             );
 
             // Track referral count if provided
-            if let ReferralCode::Present(code) = &params.referral_code {
-                let key = crate::storage::DataKey::ReferralCount(code.clone());
-                let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-                env.storage().persistent().set(&key, &(current + 1));
-            }
+            record_referral(&env, &params.referral_code)?;
 
             ids.push_back(id);
         }
@@ -4526,6 +4518,29 @@ fn is_eurc_token(env: &Env, token: &Address) -> bool {
 /// Convert amount from EURC precision (6 decimals) to contract precision
 fn normalize_eurc_amount(amount: i128) -> i128 {
     amount
+}
+
+/// Referral accounting (audited; see docs/referral-audit.md).
+///
+/// The *only* writer of `DataKey::ReferralCount`. It is called exactly once per
+/// successfully created invoice, from `submit_invoice` and
+/// `submit_invoices_batch`, after every validation has passed. There is no
+/// entry point that sets, edits, decrements or resets a count, and the
+/// `referral_code` stored on an invoice is immutable after submission.
+///
+/// `ReferralCode::None` is a no-op. The increment is checked and fails closed
+/// with `ArithmeticOverflow` (practically unreachable for a `u64`) instead of
+/// wrapping or trapping.
+fn record_referral(env: &Env, referral_code: &ReferralCode) -> Result<(), ContractError> {
+    if let ReferralCode::Present(code) = referral_code {
+        let key = crate::storage::DataKey::ReferralCount(code.clone());
+        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &next);
+    }
+    Ok(())
 }
 
 /// Validate invoice terms using the decimal precision stored for `token`.
