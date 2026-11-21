@@ -69,6 +69,9 @@ export interface ReorgRecoveryResult {
   deletedReputationUpdates: number;
   deletedInvoices: number;
   deletedLedgerHeaders: number;
+  deletedInsuranceEnrollments?: number;
+  deletedInsurancePremiums?: number;
+  deletedInsuranceClaims?: number;
   replay: ReplayResult | null;
   /** A newer divergence appeared while replaying — recovery must re-run. */
   reDetected: boolean;
@@ -155,6 +158,9 @@ interface RollbackCounts {
   deletedReputationUpdates: number;
   deletedInvoices: number;
   deletedLedgerHeaders: number;
+  deletedInsuranceEnrollments?: number;
+  deletedInsurancePremiums?: number;
+  deletedInsuranceClaims?: number;
 }
 
 /**
@@ -183,9 +189,9 @@ function rollbackIndexedState(
     const deletedReputationUpdates = db
       .prepare('DELETE FROM reputation_updates WHERE ledger >= ?')
       .run(divergenceLedger).changes;
-    db.prepare('DELETE FROM insurance_pool_enrollments WHERE ledger >= ?').run(divergenceLedger);
-    db.prepare('DELETE FROM insurance_pool_premiums WHERE ledger >= ?').run(divergenceLedger);
-    db.prepare('DELETE FROM insurance_pool_claims WHERE ledger >= ?').run(divergenceLedger);
+    const deletedInsuranceEnrollments = db.prepare('DELETE FROM insurance_pool_enrollments WHERE ledger >= ?').run(divergenceLedger).changes;
+    const deletedInsurancePremiums = db.prepare('DELETE FROM insurance_pool_premiums WHERE ledger >= ?').run(divergenceLedger).changes;
+    const deletedInsuranceClaims = db.prepare('DELETE FROM insurance_pool_claims WHERE ledger >= ?').run(divergenceLedger).changes;
 
     const deletedInvoices = db
       .prepare(
@@ -208,6 +214,9 @@ function rollbackIndexedState(
       deletedReputationUpdates,
       deletedInvoices,
       deletedLedgerHeaders,
+      deletedInsuranceEnrollments,
+      deletedInsurancePremiums,
+      deletedInsuranceClaims,
     };
   });
 
