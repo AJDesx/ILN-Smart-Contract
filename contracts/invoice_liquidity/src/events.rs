@@ -784,3 +784,43 @@ pub struct QueueTieScoreMarginUpdated {
     pub new_margin: u32,
     pub updated_by: Address,
 }
+
+// ── Issue #1165: invoice evidence commitment + verification events ────────────
+
+/// Emitted when a freelancer attaches a versioned content commitment to an
+/// invoice. `digest` is a SHA-256 commitment only — never the document or any
+/// PII. Topic: `symbol!("evidence_submitted")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceSubmitted {
+    pub invoice_id: u64,
+    pub submitter: Address,
+    /// Commitment scheme version the digest is encoded under.
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub submitted_at: u64,
+}
+
+/// Emitted when an authorized verifier marks an invoice's evidence verified.
+/// Topic: `symbol!("evidence_verified")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceVerified {
+    pub invoice_id: u64,
+    pub verifier: Address,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub verified_at: u64,
+}
+
+/// Emitted when an authorized verifier rejects an invoice's evidence.
+/// Topic: `symbol!("evidence_rejected")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceRejected {
+    pub invoice_id: u64,
+    pub verifier: Address,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub rejected_at: u64,
+}
