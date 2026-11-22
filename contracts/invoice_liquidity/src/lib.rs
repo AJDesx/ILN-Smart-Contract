@@ -124,7 +124,17 @@ impl InvoiceLiquidityContract {
     // ------------------------------------------------------------
     // initialize (multi-token aware)
     // ------------------------------------------------------------
-    /// Access: Anyone
+    /// Access: Deployer/Admin — the supplied `admin` must authorize the call.
+    ///
+    /// Issue #1162: deployment separates WASM install from initialization, so
+    /// an exposed-but-uninitialized instance could otherwise be claimed by an
+    /// arbitrary first caller, who would name itself admin and gain control
+    /// over fees, approved tokens, oracle settings, pause state, upgrades and
+    /// migrations. This entry point therefore (a) requires the intended admin
+    /// to authorize, (b) fails closed on *any* prior initialization signal via
+    /// `storage::is_initialized`, and (c) writes the authoritative
+    /// `Initialized` marker *before* touching any other state so a repeated or
+    /// competing call fails deterministically once setup starts.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -132,13 +142,25 @@ impl InvoiceLiquidityContract {
         eurc_token: Address,
         xlm_token: Address,
     ) -> Result<(), ContractError> {
-        if env
-            .storage()
-            .instance()
-            .has(&crate::storage::DataKey::InvoiceCount)
-        {
+        // Replay/competing-initializer guard. Never inferred solely from an
+        // optional field (e.g. `InvoiceCount`, which is absent after a partial
+        // setup): `is_initialized` also honours the legacy `Admin`/`Config`
+        // signals so an already-initialized (pre-#1162) deployment stays closed.
+        if crate::storage::is_initialized(&env) {
             return Err(ContractError::AlreadyInitialized);
         }
+
+        // The intended initializer must authorize the call. If the deployer
+        // and the administrator are different identities, the administrator
+        // signs this invocation — being able to deploy an instance is not the
+        // same as being allowed to initialize it.
+        admin.require_auth();
+
+        // Checks-effects-interactions: write the marker first so any
+        // duplicate or competing call fails before it can mutate state.
+        env.storage()
+            .instance()
+            .set(&crate::storage::DataKey::Initialized, &true);
 
         env.storage()
             .instance()
@@ -4579,3 +4601,6 @@ mod tests_token_safety;
 mod tests_max_depth_extension;
 // Issue #1027: Focused tests for join-order tie-breaking replacement
 mod tests_tie_breaking;
+// Issue #1162: deploy-time initialization hardening (admin authorization +
+// replay-safe/competing-initializer guards).
+mod tests_initialization_hardening;

@@ -54,10 +54,12 @@ pub enum DataKey {
     QueueResolvedAt(u64),
     /// Issue #645: ring-buffer slot for the admin action audit log, indexed
     /// by `seq % ADMIN_ACTION_LOG_CAPACITY`.
+    ///
+    /// NOTE: `AdminActionCount` is declared once, in the Instance Storage
+    /// block above. A second declaration previously existed here and made the
+    /// enum fail to compile (E0428); removing it restores the append-only
+    /// discriminant order used by the deployed layout.
     AdminActionLog(u32),
-    /// Issue #645: monotonically increasing sequence counter for the admin
-    /// action audit log (instance storage).
-    AdminActionCount,
 
     // Stats (Persistent)
     TotalInvoices,
@@ -197,6 +199,17 @@ pub enum DataKey {
     /// `best_score + margin` or higher, raising the economic barrier to
     /// equal-score manipulation.  Stored as a `u32` in instance storage.
     QueueTieScoreMargin,
+
+    // ── Issue #1162: initialization hardening ───────────────────────
+    /// Authoritative one-shot initialization marker. Written by `initialize`
+    /// *before* any other state is touched, so an exposed-but-uninitialized
+    /// instance fails deterministically once setup starts or completes and a
+    /// competing first caller cannot claim the admin role.
+    ///
+    /// Appended last on purpose: `#[contracttype]` encodes variants by
+    /// position, so inserting earlier would renumber every following key and
+    /// break existing storage (see `docs/storage-layout.md`).
+    Initialized,
 }
 
 // ----------------------------------------------------------------
@@ -294,6 +307,30 @@ pub fn get_admin(env: &Env) -> Option<Address> {
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+}
+
+/// Issue #1162: whether the contract has already been initialized.
+///
+/// The dedicated [`DataKey::Initialized`] marker is authoritative and is
+/// written by `initialize` before any other state. We additionally treat
+/// *any* legacy initialization signal as "already initialized" so that an
+/// upgrade of a deployment created before #1162 can never re-open
+/// `initialize` and hand the admin role to a newcomer:
+///
+/// - `Admin` / `Config` / `NextInvoiceId` are all written by the historical
+///   `initialize`, so their presence in instance storage means setup ran.
+/// - `InvoiceCount` is the field the previous (buggy) idempotency guard
+///   keyed on; keeping it here preserves that signal too.
+///
+/// This is deliberately conservative — a false positive only makes a
+/// duplicate `initialize` fail closed, which is the safe direction.
+pub fn is_initialized(env: &Env) -> bool {
+    let instance = env.storage().instance();
+    instance.has(&DataKey::Initialized)
+        || instance.has(&DataKey::Admin)
+        || instance.has(&DataKey::Config)
+        || instance.has(&DataKey::NextInvoiceId)
+        || instance.has(&DataKey::InvoiceCount)
 }
 
 pub fn get_config(env: &Env) -> Option<Config> {
