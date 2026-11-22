@@ -4579,6 +4579,9 @@ mod tests_token_safety;
 mod tests_max_depth_extension;
 // Issue #1027: Focused tests for join-order tie-breaking replacement
 mod tests_tie_breaking;
+// Issue #1168: executable coverage for the invoice state-transition table
+// documented in docs/invoice-state-transitions.md.
+mod tests_state_transitions;
 // Issue #1170: settlement / overpayment rollback invariants (see
 // docs/settlement-overpayment-rollback.md).
 mod tests_settlement_overpayment;
