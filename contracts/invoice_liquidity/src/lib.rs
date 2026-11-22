@@ -4582,6 +4582,10 @@ mod tests_tie_breaking;
 // Issue #1168: executable coverage for the invoice state-transition table
 // documented in docs/invoice-state-transitions.md.
 mod tests_state_transitions;
+// Issue #1169: cross-state invariants tying amount_funded, the funder ledger,
+// PartiallyFunded/Funded status, cancellation refunds and the fund queue
+// together.
+mod tests_partial_funding_invariants;
 // Issue #1170: settlement / overpayment rollback invariants (see
 // docs/settlement-overpayment-rollback.md).
 mod tests_settlement_overpayment;
