@@ -4613,6 +4613,88 @@ fn validate_invoice_terms_for_min(
     Ok(())
 }
 
+// ----------------------------------------------------------------
+// FEE-TIER / SETTLEMENT-ROUNDING INVARIANTS (Issue #1179)
+//
+// `mark_paid` splits the settled amount into a protocol fee (to the admin)
+// and a distribution (to the funding LPs). See docs/fee-tier-settlement.md
+// for the verified behavior and the residual risk.
+//
+// INV-FEE1: `effective_fee_rate` uses the tier table whenever it is
+//   non-empty and falls back to the flat `FeeRate` only when empty; the flat
+//   rate is not a floor once any tier exists.
+// INV-FEE2: the selected tier is the last entry in *storage order* whose
+//   `min_amount <= invoice_amount` — not the greatest threshold.
+//   `update_fee_tiers` does not sort the table.
+// INV-FEE3: if no tier's `min_amount` is <= the amount, the effective rate is
+//   0 (no fee); the lowest bracket's rate is not used as a minimum.
+// INV-FEE4: the tier table is bounded by `MAX_FEE_TIERS` (20);
+//   `update_fee_tiers` rejects a larger table with `TooManyFeeTiers`.
+// INV-FEE5: `protocol_fee = floor(amount * rate / 10_000)`; for rate <= 10_000
+//   the fee never exceeds the amount and `distribute = amount - fee >= 0`.
+// INV-FEE6: with a single funder holding the whole amount,
+//   `protocol_fee + funder_share == amount` exactly (contract balance
+//   unchanged by settlement).
+// INV-FEE7: the fee division truncates down; the discarded remainder is a
+//   sub-unit amount, never rounded up.
+// INV-FEE8: each `funder_share = floor(distribute * fund_amount / amount)`
+//   truncates down too; `sum(shares) <= distribute`, and the difference
+//   (dust, in `[0, N)`) stays in the contract — not redistributed, no sweep.
+//
+// Verified by tests_fee_tiers_rounding.rs. Residual risk (no on-chain fee
+// ceiling, unsorted/unvalidated tables, silent overflow→0) is enumerated in
+// the doc, not covered here.
+// ----------------------------------------------------------------
+// ----------------------------------------------------------------
+// FAILED-TRANSFER / PAYOUT ROLLBACK INVARIANTS (Issue #1178)
+//
+// A failed token transfer on a funded payout path must leave no trace.
+// See docs/failed-transfer-rollback.md for the path table and evidence.
+//
+// INV-FT1: Every funded payout (freelancer advance in `fund_invoice`,
+//   funder/protocol-fee distributions in `mark_paid`, refunds in
+//   `cancel_invoice`, `claim_default` and `resolve_dispute`, and the escrow
+//   release in `claim_pending_payout`) routes through token_safety's
+//   `transfer_out_strict` / `pay_or_escrow` / `claim_pending`.
+// INV-FT2: Those entry points follow Checks-Effects-Interactions: the
+//   terminal status / accounting write and `save_invoice` happen *before*
+//   the external transfer loop (see the `// CEI:` markers), and
+//   `claim_pending` clears the escrow before its transfer. On a trap the
+//   Soroban host rolls the whole invocation back, so the pre-transfer writes
+//   are undone together with the failed transfer — never left half-applied.
+// INV-FT3: A frozen *recipient* is escrowed (no transfer, no failure); a
+//   frozen *initiator* is rejected earlier with `AccountFrozen`. Neither
+//   path is a failed-transfer rollback.
+// INV-FT4: `ensure_spendable` may reject a payout with the typed
+//   `InsufficientContractBalance` before any token call; that is a checked
+//   error path, distinct from a token that traps mid-transfer.
+//
+// Verified by tests_failed_payout_rollback.rs (VF-1..VF-7 in the doc).
+// Residual risk (non-trapping misbehaving tokens; intentional `try_*`
+// graceful degradations) is enumerated in the doc, not covered here.
+// ----------------------------------------------------------------
+// ----------------------------------------------------------------
+// APPROVED-TOKEN ALLOWLIST INVARIANTS (Issue #1176)
+//
+// Single source of truth for "is this token usable". See
+// docs/token-allowlist-invariants.md for the full audit.
+//
+// INV-AL1: resolution order is (1) an explicit `DataKey::ApprovedToken`
+//   flag, which is authoritative once written, then (2) the Config-wired
+//   bootstrap tokens, then (3) false. Because the explicit flag wins, a
+//   `false` written by `remove_token` never falls through to re-approve a
+//   core token.
+// INV-AL2: every gate returns `ContractError::Unauthorized` for an
+//   unapproved token, and (on submission paths) does so *before* decimals
+//   or amount validation, so the error is always `Unauthorized`.
+// INV-AL3: the gate is applied at submission (`submit_invoice`,
+//   `submit_invoices_batch`, `convert_invoice_token` target,
+//   `correct_token_decimals`) and at funding (`fund_invoice`, Issue #19).
+//   `mark_paid` / settlement is deliberately NOT gated, so committed
+//   principal in a token removed mid-flight can still be repaid.
+// INV-AL4: `add_token` (re)approves; `remove_token` sets the explicit flag
+//   to false and prunes `TokenList` but leaves `TokenDecimals` intact.
+// ----------------------------------------------------------------
 fn is_approved_token(env: &Env, token: &Address) -> bool {
     // The explicit allowlist flag is authoritative once set — `initialize()`
     // sets it `true` for the three core tokens (USDC/EURC/XLM) and
@@ -4716,6 +4798,16 @@ mod tests_benchmarks;
 // Issue #1067: a trapped resource-limit invocation must roll back
 // atomically (no partial storage writes, no stranded token transfer).
 mod tests_resource_limit_failure;
+// Issue #1178: a failed Soroban token transfer on any funded payout path
+// (freelancer advance, funder distribution, protocol fee, cancel/default
+// refunds, upheld-dispute refunds, escrow release) must roll back the whole
+// invocation — invoice, funder list, volume counter and balances unchanged.
+mod tests_failed_payout_rollback;
+// Issue #1179: the effective-fee-rate selection (flat vs tiered) and the
+// integer-truncation rounding of the settlement split must be pinned:
+// tier walk order, the zero-fee floor below the lowest bracket, fee/share
+// truncation, and the dust retained in the contract.
+mod tests_fee_tiers_rounding;
 // Issue #invoice-count: get_invoice_count underflow safety
 mod tests_invoice_count;
 // Issue #batch-reputation: batch_submit increments invoices_submitted
