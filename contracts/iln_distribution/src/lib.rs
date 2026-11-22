@@ -1052,3 +1052,9 @@ mod tests_distribution_proptest;
 // success and on failure. See docs/distribution-funding-settlement.md.
 #[cfg(test)]
 mod tests_distribution_notifications;
+
+// Issue #1199: replay / duplicate-event tests — repeated funding and
+// settlement notifications must not inflate the minted distribution totals.
+// See docs/distribution-replay.md.
+#[cfg(test)]
+mod tests_distribution_replay;
