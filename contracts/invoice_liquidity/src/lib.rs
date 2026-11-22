@@ -4589,3 +4589,6 @@ mod tests_partial_funding_invariants;
 // Issue #1170: settlement / overpayment rollback invariants (see
 // docs/settlement-overpayment-rollback.md).
 mod tests_settlement_overpayment;
+// Issue #1171: default / appeal authorization and the single canonical outcome
+// (see docs/default-appeal-authorization.md).
+mod tests_default_appeal_authorization;
