@@ -210,6 +210,19 @@ pub enum DataKey {
     /// position, so inserting earlier would renumber every following key and
     /// break existing storage (see `docs/storage-layout.md`).
     Initialized,
+
+    // ── Issue #1165: invoice evidence commitment lifecycle ──────────
+    /// Versioned content commitment + verification metadata for an invoice.
+    ///
+    /// Stored separately from `Invoice`/`InvoiceCore` (like `Appeal`/
+    /// `Dispute`) so adding it does **not** change the existing invoice layout
+    /// and therefore preserves compatibility with already-stored invoices.
+    /// Appended after `Initialized` (Issue #1162) to keep the append-only
+    /// discriminant order `#[contracttype]` relies on.
+    Evidence(u64),
+    /// Maps a content-commitment digest to the invoice that first committed
+    /// it, so the same off-chain evidence cannot be financed more than once.
+    EvidenceCommitment(BytesN<32>),
 }
 
 // ----------------------------------------------------------------
@@ -331,6 +344,99 @@ pub fn is_initialized(env: &Env) -> bool {
         || instance.has(&DataKey::Config)
         || instance.has(&DataKey::NextInvoiceId)
         || instance.has(&DataKey::InvoiceCount)
+}
+
+// ----------------------------------------------------------------
+// Initialization write-sequence snapshot (Issue #1166)
+// ----------------------------------------------------------------
+
+/// Issue #1166: a read-only snapshot of the initialization signals, so
+/// operators and indexers can *verify* that an instance is not left in a
+/// partial state (authority present without token state, or vice versa).
+///
+/// Cheap and O(1): it inspects instance keys plus the three bootstrap tokens
+/// named by `Config` — it never iterates the (unbounded) approved-token list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializationState {
+    /// True when *any* initialization signal is present (see [`is_initialized`]).
+    pub initialized: bool,
+    /// True when the authoritative `Initialized` marker is present.
+    pub marker_set: bool,
+    /// True when an `Admin` is recorded.
+    pub admin_set: bool,
+    /// True when a `Config` is recorded.
+    pub config_set: bool,
+    /// Number of tokens registered in the `TokenList` (`0` = none).
+    pub token_list_len: u32,
+    /// True only when the instance is fully and consistently initialized:
+    /// authority (marker + admin + config) is present *and* each of the three
+    /// bootstrap tokens is approved with decimals registered. A `false` value
+    /// on an `initialized == true` instance means a partial setup to investigate.
+    pub consistent: bool,
+}
+
+/// Whether `token` has both an approval flag and registered decimals — the two
+/// persistent writes `initialize` makes per bootstrap token.
+fn token_fully_registered(env: &Env, token: &Address) -> bool {
+    let persistent = env.storage().persistent();
+    persistent
+        .get::<DataKey, bool>(&DataKey::ApprovedToken(token.clone()))
+        .unwrap_or(false)
+        && persistent.has(&DataKey::TokenDecimals(token.clone()))
+}
+
+/// Issue #1166: whether the instance holds complete, mutually-consistent
+/// authority and bootstrap-token state. This is the post-condition of
+/// `initialize`: because a returned `Err` rolls the whole call back, a
+/// mismatch here means no partial state is ever committed.
+pub fn initialization_is_consistent(env: &Env) -> bool {
+    let instance = env.storage().instance();
+    if !(instance.has(&DataKey::Initialized)
+        && instance.has(&DataKey::Admin)
+        && instance.has(&DataKey::Config))
+    {
+        return false;
+    }
+    let has_tokens = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<Address>>(&DataKey::TokenList)
+        .map(|list| !list.is_empty())
+        .unwrap_or(false);
+    if !has_tokens {
+        return false;
+    }
+    match get_config(env) {
+        Some(config) => {
+            token_fully_registered(env, &config.usdc_sac_address)
+                && token_fully_registered(env, &config.eurc_sac_address)
+                && token_fully_registered(env, &config.xlm_sac_address)
+        }
+        None => false,
+    }
+}
+
+/// Build the current [`InitializationState`] snapshot (Issue #1166).
+pub fn get_initialization_state(env: &Env) -> InitializationState {
+    let instance = env.storage().instance();
+    let marker_set = instance.has(&DataKey::Initialized);
+    let admin_set = instance.has(&DataKey::Admin);
+    let config_set = instance.has(&DataKey::Config);
+    let token_list_len = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<Address>>(&DataKey::TokenList)
+        .map(|list| list.len())
+        .unwrap_or(0);
+    InitializationState {
+        initialized: is_initialized(env),
+        marker_set,
+        admin_set,
+        config_set,
+        token_list_len,
+        consistent: initialization_is_consistent(env),
+    }
 }
 
 pub fn get_config(env: &Env) -> Option<Config> {

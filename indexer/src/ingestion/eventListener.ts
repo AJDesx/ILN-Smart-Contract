@@ -837,6 +837,13 @@ function canonicalEventType(rawEventType: string): string {
       return 'TwapWindowUpdated';
     case 'twap_insufficient_data':
       return 'TwapInsufficientData';
+    // Invoice evidence commitment lifecycle (Issue #1165)
+    case 'evidence_submitted':
+      return 'EvidenceSubmitted';
+    case 'evidence_verified':
+      return 'EvidenceVerified';
+    case 'evidence_rejected':
+      return 'EvidenceRejected';
     default:
       return normalized
         .split('_')
@@ -885,6 +892,10 @@ function inferRawEventType(contractEventType: string): string {
     TwapEnabledForFeed: 'twap_enabled',
     TwapWindowUpdated: 'twap_window_updated',
     TwapInsufficientData: 'twap_insufficient_data',
+    // Invoice evidence commitment lifecycle (Issue #1165)
+    EvidenceSubmitted: 'evidence_submitted',
+    EvidenceVerified: 'evidence_verified',
+    EvidenceRejected: 'evidence_rejected',
   };
 
   return mapping[contractEventType] ?? contractEventType.toLowerCase();

@@ -34,11 +34,12 @@ use oracle_registry::OracleFeedType;
 use twap_accumulator::{get_twap, record_observation, TWAPError};
 
 pub use crate::invoice::{
-    AppealRecord, FundQueueTtlMargins, Invoice, InvoiceParams, InvoiceStatus, LpFundRequest,
-    ReferralCode, ReputationProfile, ReputationScore, TopPayerEntry,
+    AppealRecord, EvidenceRecord, EvidenceStatus, FundQueueTtlMargins, Invoice, InvoiceEvidenceView,
+    InvoiceParams, InvoiceStatus, LpFundRequest, ReferralCode, ReputationProfile, ReputationScore,
+    TopPayerEntry,
 };
 pub use crate::nft::InvoiceNftMetadata;
-pub use crate::storage::DataKey;
+pub use crate::storage::{DataKey, InitializationState};
 pub use config::{Config, ConfigError};
 pub use errors::ContractError;
 pub use events::RollbackRehearsalReport;
@@ -51,7 +52,8 @@ use crate::storage::get_admin;
 use events::{
     AdminChanged, AppealResolved, ContractInitialized, ContractPaused, ContractUnpaused,
     ContractUpgraded, DefaultAppealed, DisputeResolved, DisputeUpheldPayerRefund,
-    DistributionContractUpdated, FundQueueRecovered, FundQueueResolutionAttempted, FundQueueResolved,
+    DistributionContractUpdated, EvidenceRejected, EvidenceSubmitted, EvidenceVerified,
+    FundQueueRecovered, FundQueueResolutionAttempted, FundQueueResolved,
     FundRequested,
     InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted, InvoiceDisputed, InvoiceExpired,
     InvoiceFunded, InvoicePaid, InvoicePartiallyPaid, InvoiceSubmitted, InvoiceTokenChanged,
@@ -62,13 +64,15 @@ use events::{
 use invoice::get_last_pause_timestamp;
 use invoice::{
     add_invoice_to_lp, add_invoice_to_submitter, add_volume, get_appeal, get_contract_stats,
-    get_dispute, get_fund_queue, get_fund_queue_opened_at, get_invoice_funders, get_lp_invoices,
+    get_dispute, get_evidence, get_evidence_commitment, get_fund_queue, get_fund_queue_opened_at,
+    get_invoice_funders, get_lp_invoices,
     get_lp_score, get_max_invoice_amount, get_min_payer_reputation, get_payer_score,
     get_pre_default_payer_score, get_queue_resolution, get_reputation, get_submitter_invoices,
     get_token_volume, get_token_volume_cap, increment_invoices_defaulted, increment_invoices_paid,
     increment_invoices_submitted, increment_total_funded, increment_total_invoices,
-    increment_total_paid, invoice_exists, is_paused, load_invoice, next_invoice_id,
-    remove_invoice_from_lp, remove_invoice_from_submitter, save_appeal, save_dispute,
+    increment_total_paid, invoice_exists, is_paused, next_invoice_id,
+    remove_evidence_commitment, remove_invoice_from_lp, remove_invoice_from_submitter, save_appeal,
+    save_dispute, save_evidence, save_evidence_commitment,
     save_fund_queue, save_invoice, save_invoice_funders, save_pre_default_payer_score,
     save_queue_resolution, set_lp_score, set_max_invoice_amount, set_min_payer_reputation,
     set_paused, set_payer_score, set_reputation, set_token_volume_cap, try_load_invoice,
@@ -77,6 +81,12 @@ use invoice::{
 };
 // 30-day window in seconds for a payer to file an appeal after a default.
 const APPEAL_WINDOW_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// True when a 32-byte evidence commitment digest is all zeroes — i.e. it
+/// commits to nothing and must be rejected (Issue #1165).
+fn is_zero_digest(env: &Env, digest: &BytesN<32>) -> bool {
+    digest == &BytesN::from_array(env, &[0u8; 32])
+}
 
 // ----------------------------------------------------------------
 // CONSTANTS
@@ -237,6 +247,17 @@ impl InvoiceLiquidityContract {
             .persistent()
             .set(&crate::storage::DataKey::TokenList, &list);
 
+        // Issue #1166: post-condition. All authority and bootstrap-token state
+        // must be present *together*. If any write above is ever reordered or
+        // made fallible and leaves the instance inconsistent, this fails and —
+        // because a returned `Err` rolls the whole invocation back — an
+        // instance that carries partial authority or token state can never be
+        // committed. The event below is therefore only published on a fully
+        // consistent (and durably committed) initialization.
+        if !crate::storage::initialization_is_consistent(&env) {
+            return Err(ContractError::InitializationInconsistent);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "initialized"), admin.clone()),
             ContractInitialized {
@@ -249,6 +270,20 @@ impl InvoiceLiquidityContract {
         );
 
         Ok(())
+    }
+
+    // ------------------------------------------------------------
+    // Initialization state view (Issue #1166)
+    // ------------------------------------------------------------
+    /// Access: Anyone
+    ///
+    /// Read-only snapshot of the initialization signals, so operators and
+    /// indexers can verify an instance is not left in a partial state. See
+    /// [`crate::storage::InitializationState`].
+    pub fn get_initialization_state(
+        env: Env,
+    ) -> crate::storage::InitializationState {
+        crate::storage::get_initialization_state(&env)
     }
 
     // ------------------------------------------------------------
@@ -277,7 +312,10 @@ pub fn set_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         require_admin(&env)?;
         check_rate_limit(&env, "set_admin", ADMIN_CHANGE_COOLDOWN_LEDGERS)?;
         record_admin_action(&env, "set_admin");
-        let old_admin: Address = env.storage().instance().get(&StorageKey::Admin).unwrap();
+        // Issue #1167: read the outgoing admin through the checked helper so a
+        // missing Admin key returns `Unauthorized` rather than trapping the
+        // host. `require_admin` above already guarantees the key is present.
+        let old_admin: Address = get_admin(&env).ok_or(ContractError::Unauthorized)?;
         env.storage().instance().set(&StorageKey::Admin, &new_admin);
         env.events().publish(
             (Symbol::new(&env, "admin_changed"),),
@@ -946,11 +984,9 @@ pub fn add_token(env: Env, token: Address, decimals: u32) -> Result<(), Contract
         check_rate_limit(&env, "add_token", DEFAULT_RATE_LIMIT_LEDGERS)?;
         record_admin_action(&env, "add_token");
 
-        let admin_address: Address = env
-            .storage()
-            .instance()
-            .get(&crate::storage::DataKey::Admin)
-            .unwrap();
+        // Issue #1167: resolve the admin via the checked helper so a missing
+        // Admin key returns `Unauthorized` instead of trapping the host.
+        let admin_address: Address = get_admin(&env).ok_or(ContractError::Unauthorized)?;
 
         // Issue #1070: the declared precision must match the token's own
         // `decimals()`; tokens that cannot report decimals are rejected.
@@ -1871,7 +1907,13 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
 
         for i in start..end {
             if let Some(id) = invoice_ids.get(i) {
-                result.push_back(load_invoice(&env, id));
+                // Issue #1167: skip a dangling index entry rather than trapping
+                // the whole read-only query via load_invoice's
+                // `expect("invoice not found")`. The paginated views cannot
+                // surface a ContractError, so skipping is the fail-soft path.
+                if let Some(invoice) = try_load_invoice(&env, id) {
+                    result.push_back(invoice);
+                }
             }
         }
 
@@ -1897,7 +1939,13 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
 
         for i in start..end {
             if let Some(id) = invoice_ids.get(i) {
-                result.push_back(load_invoice(&env, id));
+                // Issue #1167: skip a dangling index entry rather than trapping
+                // the whole read-only query via load_invoice's
+                // `expect("invoice not found")`. The paginated views cannot
+                // surface a ContractError, so skipping is the fail-soft path.
+                if let Some(invoice) = try_load_invoice(&env, id) {
+                    result.push_back(invoice);
+                }
             }
         }
 
@@ -2037,7 +2085,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
         require_submitter_by_id(&env, &freelancer, invoice_id)?;
 
         if invoice.status == InvoiceStatus::Pending
@@ -2115,7 +2163,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
         require_submitter_by_id(&env, &freelancer, invoice_id)?;
 
         // Only allowed in Pending state
@@ -2311,7 +2359,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::NotApprovedFunder);
         }
 
-        let invoice = load_invoice(&env, invoice_id);
+        let invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
         match invoice.status {
             InvoiceStatus::Pending | InvoiceStatus::PartiallyFunded => {}
             InvoiceStatus::Funded => return Err(ContractError::AlreadyFunded),
@@ -2992,7 +3040,7 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         require_submitter_by_id(&env, &invoice.freelancer, invoice_id)?;
 
@@ -3060,7 +3108,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
         match invoice.status {
             InvoiceStatus::Funded => {}
             InvoiceStatus::Pending | InvoiceStatus::PartiallyFunded => {
@@ -3128,7 +3176,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         require_submitter_by_id(&env, &invoice.freelancer, invoice_id)?;
 
@@ -3194,7 +3242,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         if env.ledger().timestamp() <= u64::from(invoice.due_date) {
             return Err(ContractError::NotYetDefaulted);
@@ -3332,11 +3380,10 @@ pub fn transfer_lp_position(
         let protocol_fee = invoice.amount.checked_mul(fee_rate as i128).unwrap_or(0) / 10_000;
 
         if protocol_fee > 0 {
-            let admin: Address = env
-                .storage()
-                .instance()
-                .get(&crate::storage::DataKey::Admin)
-                .unwrap();
+            // Issue #1167: the fee recipient is the admin; resolve it through
+            // the checked helper so a missing Admin key returns `Unauthorized`
+            // instead of trapping mid-settlement.
+            let admin: Address = get_admin(&env).ok_or(ContractError::Unauthorized)?;
             // Issue #1072: a frozen fee recipient must not block settlement.
             token_safety::pay_or_escrow(&env, &invoice.token, &admin, protocol_fee, invoice_id)?;
         }
@@ -3445,7 +3492,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let invoice = load_invoice(&env, invoice_id);
+        let invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         // Only the funder can query their own yield
         if let Some(ref funder) = invoice.funder {
@@ -3492,7 +3539,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         let funders = get_invoice_funders(&env, invoice_id);
         let mut is_funder = false;
@@ -3642,7 +3689,7 @@ pub fn transfer_lp_position(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         // Only the payer may appeal.
         require_payer_by_id(&env, invoice_id)?;
@@ -3725,7 +3772,7 @@ pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), Con
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         if invoice.status != InvoiceStatus::Appealed {
             return Err(ContractError::NotDefaulted);
@@ -3794,7 +3841,7 @@ pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), Con
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         // Only the payer may dispute.
         require_payer_by_id(&env, invoice_id)?;
@@ -3848,6 +3895,219 @@ pub fn resolve_appeal(env: Env, invoice_id: u64, upheld: bool) -> Result<(), Con
         Ok(())
     }
 
+    // ------------------------------------------------------------
+    // Issue #1165: invoice evidence commitment + verification lifecycle
+    // ------------------------------------------------------------
+
+    /// Attach a versioned content commitment to an invoice (Issue #1165).
+    ///
+    /// Stores a SHA-256 digest of the off-chain evidence bundle plus
+    /// verification metadata. **No document content or PII is stored** — only
+    /// the commitment. Re-attaching is permitted **only while the current
+    /// commitment is still `Unverified`**, so verified/rejected evidence
+    /// cannot be swapped out afterwards. The same digest may only ever be
+    /// attached to a single invoice, which prevents the same off-chain
+    /// evidence from being financed twice.
+    ///
+    /// # Errors
+    /// * `EvidenceAlreadyReviewed` if the current commitment is already
+    ///   verified or rejected
+    /// * `DuplicateEvidenceCommitment` if this digest is attached elsewhere
+    /// * `InvalidEvidenceCommitment` if the digest is zero or `version == 0`
+    /// * plus the usual invoice-state errors
+    ///
+    /// Access: Invoice freelancer only
+    pub fn attach_invoice_evidence(
+        env: Env,
+        freelancer: Address,
+        invoice_id: u64,
+        version: u32,
+        digest: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        if is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
+
+        if !invoice_exists(&env, invoice_id) {
+            return Err(ContractError::InvoiceNotFound);
+        }
+
+        // Only the invoice's freelancer may attest to (commit) its evidence.
+        require_submitter_by_id(&env, &freelancer, invoice_id)?;
+
+        // Reject an unusable commitment: a zero digest commits to nothing and
+        // version `0` is not a supported scheme version.
+        if version == 0 || is_zero_digest(&env, &digest) {
+            return Err(ContractError::InvalidEvidenceCommitment);
+        }
+
+        let invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
+
+        // Attachable until the invoice reaches a terminal state.
+        match invoice.status {
+            InvoiceStatus::Pending
+            | InvoiceStatus::PartiallyFunded
+            | InvoiceStatus::Funded
+            | InvoiceStatus::Disputed => {}
+            InvoiceStatus::Paid => return Err(ContractError::AlreadyPaid),
+            InvoiceStatus::Defaulted => return Err(ContractError::InvoiceDefaulted),
+            InvoiceStatus::Appealed => return Err(ContractError::InvoiceAppealed),
+            InvoiceStatus::Expired => return Err(ContractError::InvoiceExpired),
+            InvoiceStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
+        }
+
+        // A reviewed commitment is frozen: it can no longer be replaced.
+        if let Some(existing) = get_evidence(&env, invoice_id) {
+            if existing.status != EvidenceStatus::Unverified {
+                return Err(ContractError::EvidenceAlreadyReviewed);
+            }
+            // Replacing an unreviewed commitment releases the superseded
+            // digest's duplicate-financing marker, so a corrected digest no
+            // longer strands a phantom lock on that digest.
+            if existing.digest != digest {
+                remove_evidence_commitment(&env, &existing.digest);
+            }
+        }
+
+        // Duplicate-financing guard: the same commitment digest may only ever
+        // be attached to a single invoice.
+        if let Some(owner) = get_evidence_commitment(&env, &digest) {
+            if owner != invoice_id {
+                return Err(ContractError::DuplicateEvidenceCommitment);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let record = EvidenceRecord {
+            version,
+            digest: digest.clone(),
+            status: EvidenceStatus::Unverified,
+            submitted_by: freelancer.clone(),
+            submitted_at: now,
+            verified_by: None,
+            verified_at: None,
+        };
+
+        save_evidence(&env, invoice_id, &record);
+        save_evidence_commitment(&env, &digest, invoice_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "evidence_submitted"),
+                invoice_id,
+                freelancer.clone(),
+            ),
+            EvidenceSubmitted {
+                invoice_id,
+                submitter: freelancer,
+                version,
+                digest,
+                submitted_at: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Record a verification decision for an invoice's evidence commitment
+    /// (Issue #1165).
+    ///
+    /// `approved = true` marks the evidence `Verified`; `false` marks it
+    /// `Rejected`. Once a decision is recorded the commitment is frozen — it
+    /// cannot be re-attached or re-reviewed.
+    ///
+    /// Access: Admin only
+    pub fn verify_invoice_evidence(
+        env: Env,
+        invoice_id: u64,
+        approved: bool,
+    ) -> Result<(), ContractError> {
+        lock_reentrancy(&env)?;
+
+        require_admin(&env)?;
+        record_admin_action(&env, "verify_invoice_evidence");
+
+        if !invoice_exists(&env, invoice_id) {
+            unlock_reentrancy(&env);
+            return Err(ContractError::InvoiceNotFound);
+        }
+
+        let mut record = get_evidence(&env, invoice_id).ok_or(ContractError::EvidenceNotFound)?;
+
+        if record.status != EvidenceStatus::Unverified {
+            unlock_reentrancy(&env);
+            return Err(ContractError::EvidenceAlreadyReviewed);
+        }
+
+        let admin = get_admin(&env).ok_or(ContractError::Unauthorized)?;
+        let now = env.ledger().timestamp();
+        record.status = if approved {
+            EvidenceStatus::Verified
+        } else {
+            EvidenceStatus::Rejected
+        };
+        record.verified_by = Some(admin.clone());
+        record.verified_at = Some(now);
+        save_evidence(&env, invoice_id, &record);
+
+        if approved {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "evidence_verified"),
+                    invoice_id,
+                    admin.clone(),
+                ),
+                EvidenceVerified {
+                    invoice_id,
+                    verifier: admin,
+                    version: record.version,
+                    digest: record.digest.clone(),
+                    verified_at: now,
+                },
+            );
+        } else {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "evidence_rejected"),
+                    invoice_id,
+                    admin.clone(),
+                ),
+                EvidenceRejected {
+                    invoice_id,
+                    verifier: admin,
+                    version: record.version,
+                    digest: record.digest.clone(),
+                    rejected_at: now,
+                },
+            );
+        }
+
+        unlock_reentrancy(&env);
+        Ok(())
+    }
+
+    /// Read the evidence commitment + verification view for an invoice
+    /// (Issue #1165). Returns `None` when no commitment has been attached.
+    /// The `disputed` flag reflects the invoice's live dispute condition so a
+    /// client can render the full submitted/verified/rejected/disputed
+    /// lifecycle from one call.
+    ///
+    /// Access: Anyone
+    pub fn get_invoice_evidence(env: Env, invoice_id: u64) -> Option<InvoiceEvidenceView> {
+        let record = get_evidence(&env, invoice_id)?;
+        Some(InvoiceEvidenceView {
+            invoice_id,
+            version: record.version,
+            digest: record.digest,
+            status: record.status,
+            submitted_by: record.submitted_by,
+            submitted_at: record.submitted_at,
+            verified_by: record.verified_by,
+            verified_at: record.verified_at,
+            disputed: get_dispute(&env, invoice_id).is_some(),
+        })
+    }
+
 /// Resolve a dispute (admin / governance only).
 ///
 /// # Arguments
@@ -3879,7 +4139,7 @@ pub fn resolve_dispute(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         if invoice.status != InvoiceStatus::Disputed {
             return Err(ContractError::NotDisputed);
@@ -3988,7 +4248,7 @@ pub fn resolve_dispute(
             return Err(ContractError::InvoiceNotFound);
         }
 
-        let mut invoice = load_invoice(&env, invoice_id);
+        let mut invoice = try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
 
         if invoice.status != InvoiceStatus::Disputed {
             return Err(ContractError::NotDisputed);
@@ -4303,7 +4563,7 @@ pub fn set_token_volume_cap(
         if !invoice_exists(&env, invoice_id) {
             return Err(ContractError::InvoiceNotFound);
         }
-        Ok(load_invoice(&env, invoice_id))
+        try_load_invoice(&env, invoice_id).ok_or(ContractError::InvoiceNotFound)
     }
 
     /// Access: Anyone
@@ -4604,3 +4864,10 @@ mod tests_tie_breaking;
 // Issue #1162: deploy-time initialization hardening (admin authorization +
 // replay-safe/competing-initializer guards).
 mod tests_initialization_hardening;
+// Issue #1165: invoice evidence commitment + verification lifecycle
+// (submitted/verified/rejected/disputed transitions + duplicate-financing
+// guard).
+mod tests_evidence_lifecycle;
+// Issue #1167: predictable missing-state reads (absent invoice / admin) return
+// typed ContractErrors instead of trapping the host via unwrap/expect.
+mod tests_unwrap_hardening;

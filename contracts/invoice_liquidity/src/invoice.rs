@@ -270,6 +270,75 @@ pub struct DisputeRecord {
     pub disputed_at: u32,
 }
 
+// ----------------------------------------------------------------
+// Issue #1165: invoice evidence commitment + verification lifecycle
+// ----------------------------------------------------------------
+
+/// Verification status of an invoice's evidence commitment.
+///
+/// This maps onto the issue's auditable lifecycle states:
+///   * **submitted** — a record exists with [`EvidenceStatus::Unverified`],
+///   * **verified**  — an authorized verifier approved it,
+///   * **rejected**  — an authorized verifier rejected it,
+///   * **disputed**  — the *invoice* carries a [`DisputeRecord`]. This is a
+///     condition on the invoice rather than a state of the commitment, so it
+///     is surfaced by [`InvoiceEvidenceView::disputed`] instead of being
+///     stored here.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvidenceStatus {
+    Unverified,
+    Verified,
+    Rejected,
+}
+
+/// A *versioned content commitment* to off-chain evidence plus the
+/// verification metadata for an invoice (Issue #1165).
+///
+/// Only a cryptographic digest is stored on-chain — **never the document or
+/// any PII**. `version` identifies the commitment scheme so the digest's
+/// algorithm/encoding stays unambiguous as the scheme evolves.
+///
+/// Stored in its own storage entry (like [`AppealRecord`]/[`DisputeRecord`]),
+/// so introducing it does not alter the existing `Invoice`/`InvoiceCore`
+/// layout and therefore preserves compatibility with already-stored invoices.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceRecord {
+    /// Commitment scheme version the `digest` is encoded under.
+    pub version: u32,
+    /// SHA-256 digest of the off-chain evidence bundle.
+    pub digest: BytesN<32>,
+    /// Current verification status.
+    pub status: EvidenceStatus,
+    /// Address that attached the commitment (the invoice freelancer).
+    pub submitted_by: Address,
+    /// Ledger timestamp when the commitment was attached.
+    pub submitted_at: u64,
+    /// Verifier that recorded the decision, if any.
+    pub verified_by: Option<Address>,
+    /// Ledger timestamp of the verification/rejection decision, if any.
+    pub verified_at: Option<u64>,
+}
+
+/// Read view combining an invoice's evidence commitment, its verification
+/// metadata, and the invoice-level `disputed` condition, so a client can
+/// render the full lifecycle from a single call (Issue #1165).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvoiceEvidenceView {
+    pub invoice_id: u64,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub status: EvidenceStatus,
+    pub submitted_by: Address,
+    pub submitted_at: u64,
+    pub verified_by: Option<Address>,
+    pub verified_at: Option<u64>,
+    /// True when the invoice currently has a dispute on record.
+    pub disputed: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopPayerEntry {
@@ -826,6 +895,50 @@ pub fn save_dispute(env: &Env, invoice_id: u64, record: &DisputeRecord) {
     env.storage()
         .persistent()
         .set(&StorageKey::Dispute(invoice_id), record);
+}
+
+// Issue #1165: evidence commitment storage helpers
+
+/// Load an invoice's evidence commitment record, if one has been attached.
+pub fn get_evidence(env: &Env, invoice_id: u64) -> Option<EvidenceRecord> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::Evidence(invoice_id))
+}
+
+pub fn save_evidence(env: &Env, invoice_id: u64, record: &EvidenceRecord) {
+    let key = StorageKey::Evidence(invoice_id);
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 1_000_000, 2_000_000);
+}
+
+/// Invoice id that first committed `digest`, if any. Used to reject the same
+/// off-chain evidence being financed more than once (Issue #1165).
+pub fn get_evidence_commitment(env: &Env, digest: &BytesN<32>) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::EvidenceCommitment(digest.clone()))
+}
+
+/// Release the duplicate-financing marker for `digest`. Called when a
+/// freelancer corrects an *unreviewed* commitment: the superseded digest is no
+/// longer attached to any invoice, so it must not remain locked to this one
+/// (which would otherwise spuriously reject committing that same digest to its
+/// rightful invoice). No-op if no marker exists.
+pub fn remove_evidence_commitment(env: &Env, digest: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::EvidenceCommitment(digest.clone()));
+}
+
+pub fn save_evidence_commitment(env: &Env, digest: &BytesN<32>, invoice_id: u64) {
+    let key = StorageKey::EvidenceCommitment(digest.clone());
+    env.storage().persistent().set(&key, &invoice_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 1_000_000, 2_000_000);
 }
 
 // ----------------------------------------------------------------
